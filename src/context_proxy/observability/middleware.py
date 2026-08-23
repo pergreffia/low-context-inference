@@ -174,14 +174,22 @@ class ObservabilityMiddleware:
             if content_length is None:
                 # No Content-Length (chunked): pre-buffer up to the cap so
                 # enforcement happens BEFORE the app reads anything.
-                messages, exceeded = await _drain_body(receive, self._max_body_bytes)
-                if exceeded:
+                messages, outcome = await _drain_body(receive, self._max_body_bytes)
+                if outcome == "oversized":
                     HTTP_REQUESTS_TOTAL.labels(
                         method=scope["method"], route=route, status="413"
                     ).inc()
                     logger.warning("request_too_large", extra={"route": route})
                     await reject(413, "request_too_large",
                                  f"request body exceeds {self._max_body_bytes} bytes")
+                    return
+                if outcome == "disconnected":
+                    # Client vanished mid-upload: never reach the application,
+                    # never fabricate a normal end-of-body on its behalf.
+                    # (Context var is restored by the finally below.)
+                    logger.info(
+                        "client_disconnected_during_body", extra={"route": route}
+                    )
                     return
                 receive = _replaying_receive(messages, receive)
             await self.app(scope, receive, send_wrapper)
@@ -225,34 +233,35 @@ def record_stage(request, name: str, started_monotonic: float) -> None:
     stages[name] = time.monotonic() - started_monotonic
 
 
-async def _drain_body(receive, max_body_bytes: int) -> tuple[list[dict], bool]:
-    """Buffer request messages up to max_body_bytes; stop AT first violation.
+async def _drain_body(receive, max_body_bytes: int) -> tuple[list[dict], str]:
+    """Buffer request messages up to max_body_bytes.
 
-    Returns (buffered_messages, exceeded). When exceeded the middleware
-    answers 413 immediately WITHOUT consuming any further request messages:
-    continuing to read arbitrarily large bodies would waste bandwidth/CPU and
-    hold connections open (M5 final review §1). The ASGI server is then
-    responsible for closing the connection after our short response.
+    Returns (buffered_messages, outcome) where outcome is one of:
 
-    A client disconnect mid-body yields the bytes received so far terminated
-    by a synthetic end-of-body message; the application sees a short body.
+    - "ok":           body fully within the cap; messages are replayable;
+    - "oversized":    cap violated -> caller answers 413 WITHOUT consuming any
+                      further message (immediate stop, no arbitrary drain);
+    - "disconnected": client went away mid-body -> caller must NOT invoke the
+                      application and must NEVER synthesize a normal
+                      end-of-body for it (disconnect != normal completion).
+
+    The ASGI server owns the connection afterwards in every non-"ok" case.
     """
     buffered: list[dict] = []
     total = 0
     while True:
         message = await receive()
         if message["type"] == "http.disconnect":
-            buffered.append({"type": "http.request", "body": b"", "more_body": False})
-            return buffered, False
+            return [], "disconnected"
         if message["type"] != "http.request":
             continue
         total += len(message.get("body") or b"")
         if total > max_body_bytes:
             # Hard stop: no further receive() consumption of an oversized body.
-            return [], True
+            return [], "oversized"
         buffered.append(message)
         if not message.get("more_body"):
-            return buffered, False
+            return buffered, "ok"
 
 
 def _replaying_receive(messages: list[dict], original_receive):

@@ -542,6 +542,58 @@ class TestBodyLimitWithoutContentLength:
         assert sent_statuses == [413]
         assert receive_calls["n"] == 2  # NOT all {total_chunks} messages
 
+    def test_asgi_disconnect_during_body_never_reaches_app(self):
+        """Client disconnect mid-upload: app NOT invoked, no synthetic body.
+
+        http.disconnect must NEVER be converted into a normal end-of-body
+        http.request (M5 final mini-fix §1-§2).
+        """
+        from context_proxy.observability.middleware import ObservabilityMiddleware
+
+        reached_app = {"flag": False}
+        forwarded: list[dict] = []
+
+        async def app(scope, receive, send):  # pragma: no cover - must NOT run
+            reached_app["flag"] = True
+            while True:
+                forwarded.append(await receive())
+                if not forwarded[-1].get("more_body"):
+                    break
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        sent_messages: list[dict] = []
+        receive_sequence = [
+            {"type": "http.request", "body": b"partial", "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+
+        async def receive():
+            if receive_sequence:
+                return receive_sequence.pop(0)
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent_messages.append(message)
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("test", 123),
+            "state": {},
+        }
+
+        middleware = ObservabilityMiddleware(app, max_body_bytes=150)
+        asyncio.run(middleware(scope, receive, send))
+
+        assert reached_app["flag"] is False      # application never invoked
+        assert forwarded == []                   # nothing synthesized/forwarded
+        # no normal response either: the connection is already gone
+        starts = [m for m in sent_messages if m["type"] == "http.response.start"]
+        assert starts == []
+
     def test_asgi_under_limit_replays_body_to_app(self):
         """Under the cap: app runs and receives the exact buffered body."""
         from context_proxy.observability.middleware import ObservabilityMiddleware
