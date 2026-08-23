@@ -16,6 +16,22 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 
+class HistoryDivergenceError(Exception):
+    """Incoming history conflicts with persisted history at some index.
+
+    The database is left untouched; the caller must reject the request
+    (master prompt: raw history is the source of truth and is never rewritten).
+    """
+
+    def __init__(self, conversation_id: str, index: int):
+        self.conversation_id = conversation_id
+        self.index = index
+        super().__init__(
+            f"conversation {conversation_id}: incoming message {index} "
+            f"diverges from persisted history"
+        )
+
+
 class PostgresConversationStore:
     def __init__(self, pool: asyncpg.Pool):
         self._pool = pool
@@ -38,7 +54,10 @@ class PostgresConversationStore:
         )
 
     async def append_messages(
-        self, conversation_id: str, messages: list[dict[str, Any]]
+        self,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
     ) -> list[str]:
         """Persist raw messages in order; extract tool calls/results.
 
@@ -47,6 +66,7 @@ class PostgresConversationStore:
         if not messages:
             return []
         message_ids: list[str] = []
+        meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else "{}"
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await self._ensure_conversation(conn, conversation_id)
@@ -58,14 +78,15 @@ class PostgresConversationStore:
                     seq += 1
                     message_id = await conn.fetchval(
                         """
-                        INSERT INTO messages (conversation_id, seq, role, content)
-                        VALUES ($1::uuid, $2, $3, $4::jsonb)
+                        INSERT INTO messages (conversation_id, seq, role, content, metadata)
+                        VALUES ($1::uuid, $2, $3, $4::jsonb, $5::jsonb)
                         RETURNING id
                         """,
                         conversation_id,
                         seq,
                         message.get("role"),
                         json.dumps(message, ensure_ascii=False),
+                        meta_json,
                     )
                     message_ids.append(str(message_id))
                     await self._persist_tool_parts(conn, conversation_id, message_id, message)
@@ -74,6 +95,28 @@ class PostgresConversationStore:
             extra={"conversation_id": conversation_id, "count": len(message_ids)},
         )
         return message_ids
+
+    async def reconcile_history(
+        self, conversation_id: str, messages: list[dict[str, Any]]
+    ) -> list[str]:
+        """Idempotently sync a full client history (M2.1 §1).
+
+        Full-history clients resend the entire conversation each turn: only the
+        new suffix is appended. Comparison is positional raw-content equality
+        (parsed JSON), never content-based deduplication — identical messages
+        may legitimately occur multiple times.
+
+        Raises HistoryDivergenceError without touching the database when the
+        incoming prefix conflicts with persisted history.
+        """
+        persisted = await self.get_messages(conversation_id)
+        overlap = min(len(persisted), len(messages))
+        for index in range(overlap):
+            if persisted[index] != messages[index]:
+                raise HistoryDivergenceError(conversation_id, index)
+        if len(messages) <= len(persisted):
+            return []
+        return await self.append_messages(conversation_id, messages[len(persisted):])
 
     @staticmethod
     async def _persist_tool_parts(

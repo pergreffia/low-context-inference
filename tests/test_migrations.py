@@ -121,3 +121,109 @@ def test_tool_result_fk_and_uniqueness_enforced():
             await pool.close()
 
     asyncio.run(_run())
+
+
+def test_failed_migration_rolls_back_and_is_retryable(tmp_path):
+    """10.17: failing migration leaves no marker; corrected file runs later."""
+    import asyncio
+
+    from context_proxy.db.database import apply_migrations
+
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "0100_probe.sql").write_text("CREATE TABLE zz_probe(id INT);")
+    (migrations / "0200_broken.sql").write_text("THIS IS NOT VALID SQL;")
+
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            with pytest.raises(asyncpg.PostgresError):
+                await apply_migrations(pool, migrations)
+
+            applied = {
+                r["name"]
+                for r in await pool.fetch(
+                    "SELECT name FROM schema_migrations WHERE name LIKE '02%'"
+                )
+            }
+            assert applied == set()  # failed migration NOT marked
+
+            probe_exists = await pool.fetchval("SELECT to_regclass('zz_probe') IS NOT NULL")
+            assert probe_exists  # earlier migration in same run committed fine
+
+            # correct the broken migration and retry
+            (migrations / "0200_broken.sql").write_text("CREATE TABLE zz_ok(id INT);")
+            completed = await apply_migrations(pool, migrations)
+            assert completed == ["0200_broken.sql"]
+
+            marked = {
+                r["name"]
+                for r in await pool.fetch(
+                    "SELECT name FROM schema_migrations WHERE name LIKE '0%'"
+                )
+            }
+            assert {"0100_probe.sql", "0200_broken.sql"} <= marked
+            assert await pool.fetchval("SELECT to_regclass('zz_ok') IS NOT NULL")
+        finally:
+            # cleanup probe tables
+            await pool.execute("DROP TABLE IF EXISTS zz_ok")
+            await pool.execute("DROP TABLE IF EXISTS zz_probe")
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_concurrent_startup_applies_each_exactly_once():
+    """10.18: two racing startups -> advisory lock serializes; no double apply."""
+    import asyncio
+
+    from context_proxy.db.database import apply_migrations
+
+    async def _run():
+        pool_a = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        pool_b = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            for table in (
+                "summaries",
+                "memory_records",
+                "conversation_chunks",
+                "tool_results",
+                "tool_calls",
+                "messages",
+                "conversations",
+                "schema_migrations",
+            ):
+                await pool_a.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+
+            results = await asyncio.gather(
+                apply_migrations(pool_a),
+                apply_migrations(pool_b),
+            )
+
+            names = [name for result in results for name in result]
+            expected = {
+                "0001_init.sql",
+                "0002_tool_result_integrity.sql",
+                "0003_message_metadata.sql",
+            }
+            # every migration applied exactly once across both runners
+            assert len(names) == len(set(names))
+            assert set(names) == expected
+
+            counts = await pool_a.fetch(
+                """
+                SELECT name, count(*) AS n FROM schema_migrations
+                GROUP BY name HAVING count(*) > 1
+                """
+            )
+            assert counts == []
+            total = await pool_a.fetchval(
+                "SELECT count(*) FROM schema_migrations WHERE name = ANY($1)",
+                sorted(expected),
+            )
+            assert total == len(expected)
+        finally:
+            await pool_a.close()
+            await pool_b.close()
+
+    asyncio.run(_run())

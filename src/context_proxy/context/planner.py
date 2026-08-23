@@ -32,7 +32,7 @@ class ContextOverflowError(Exception):
         )
 
 
-UnitKind = Literal["system", "user", "assistant", "interaction"]
+UnitKind = Literal["system", "turn", "prefill"]
 
 
 @dataclass(frozen=True)
@@ -62,35 +62,45 @@ class ContextPlan:
 
 
 def segment_messages(messages: list[dict[str, Any]], counter: TokenCounter) -> list[Unit]:
-    """Group messages into atomic units; tool results stay with their calls."""
+    """Group messages into atomic interaction units (M2.1 §3).
+
+    A turn starts at a user message and spans everything up to the next user
+    message: user -> assistant(tool_call) -> tool(result) -> assistant(final)
+    stays one indivisible unit. System messages are their own units. Messages
+    preceding the first user message (rare assistant prefill) form a droppable
+    prefill unit so no assistant is ever retained without its interaction.
+    """
     units: list[Unit] = []
-    index = 0
-    while index < len(messages):
-        message = messages[index]
+    prefill: list[dict[str, Any]] = []
+    turn: list[dict[str, Any]] | None = None
+
+    def close_turn() -> None:
+        nonlocal turn
+        if turn:
+            units.append(Unit("turn", tuple(turn), counter.messages(turn)))
+            turn = None
+
+    def close_prefill() -> None:
+        if prefill:
+            units.append(Unit("prefill", tuple(prefill), counter.messages(prefill)))
+            prefill.clear()
+
+    for message in messages:
         role = message.get("role")
-        if role == "assistant" and message.get("tool_calls"):
-            call_ids = {
-                tc.get("id")
-                for tc in message["tool_calls"]
-                if isinstance(tc, dict) and tc.get("id")
-            }
-            end = index + 1
-            while end < len(messages) and messages[end].get("role") == "tool":
-                if call_ids and messages[end].get("tool_call_id") not in call_ids:
-                    break  # belongs to a different assistant turn
-                end += 1
-            chunk = tuple(messages[index:end])
-            units.append(Unit("interaction", chunk, counter.messages(list(chunk))))
-            index = end
-            continue
-        if role == "system":
-            kind: UnitKind = "system"
+        if role == "user":
+            close_turn()
+            close_prefill()
+            turn = [message]
+        elif role == "system":
+            close_turn()
+            close_prefill()
+            units.append(Unit("system", (message,), counter.messages([message])))
+        elif turn is not None:
+            turn.append(message)
         else:
-            # user / assistant / orphan tool result -> individually droppable
-            kind = "user" if role == "user" else "assistant"
-        chunk = (message,)
-        units.append(Unit(kind, chunk, counter.messages(list(chunk))))
-        index += 1
+            prefill.append(message)
+    close_turn()
+    close_prefill()
     return units
 
 
@@ -99,17 +109,20 @@ def plan_context(
     *,
     tools: list[dict[str, Any]] | None,
     usable_budget: int,
+    reserved_tokens: int = 0,
     counter: TokenCounter | None = None,
 ) -> ContextPlan:
     """Build the largest within-budget raw context from recent messages.
 
     Priority when trimming (master prompt §16): system prompts and the current
-    request are never sacrificed; oldest non-system units are dropped first.
+    request are never sacrificed; oldest non-system units are dropped whole.
+    reserved_tokens covers future context consumers (e.g. pinned state, M3+)
+    so the final context can never exceed usable_budget once they land.
     Raises ContextOverflowError if no valid plan exists.
     """
     counter = counter or TokenCounter()
     tools_tokens = counter.tools(tools)
-    available_for_messages = usable_budget - tools_tokens
+    available_for_messages = usable_budget - tools_tokens - reserved_tokens
 
     original = segment_messages(messages, counter)
     kept: list[Unit | None] = list(original)

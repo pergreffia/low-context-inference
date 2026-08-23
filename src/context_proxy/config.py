@@ -26,6 +26,17 @@ class DatabaseSettings(BaseModel):
     connect_timeout_seconds: float = Field(default=3.0, gt=0)
 
 
+class ConversationSettings(BaseModel):
+    """Conversation identity configuration (M2.1 §2).
+
+    Precedence: body conversation_id > X-Conversation-ID > client_id_header
+    > generated UUID. Do not hard-code a client-specific header.
+    """
+
+    client_id_header: str = "X-Session-ID"
+    max_session_identity_chars: int = Field(default=128, gt=0)
+
+
 class ContextSettings(BaseModel):
     """Context budget configuration (master prompt §14, §15).
 
@@ -55,6 +66,7 @@ class Settings(BaseSettings):
     server: ServerSettings = ServerSettings()
     database: DatabaseSettings = DatabaseSettings()
     context: ContextSettings = ContextSettings()
+    conversation: ConversationSettings = ConversationSettings()
     inference: EndpointSettings = EndpointSettings()
     compact: EndpointSettings = EndpointSettings(
         base_url="http://localhost:8001/v1",

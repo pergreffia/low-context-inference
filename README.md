@@ -9,7 +9,9 @@ See `context-proxy-master-prompt.md` for the full design.
 M1 foundation plus:
 
 - **Raw persistence** (PostgreSQL, source of truth): conversations, messages (verbatim JSONB), tool calls/results with relational integrity. The original conversation is always reconstructable.
-- **Conversation identification**: pass `X-Conversation-ID` header or a `conversation_id` body field; the id is echoed back via `X-Conversation-ID` response header and never forwarded upstream. Without it, each request is an isolated conversation. PostgreSQL unavailable → passthrough continues in degraded mode (nothing persisted).
+- **Conversation identification** (precedence): body `conversation_id` > `X-Conversation-ID` header > configured session header (`CONVERSATION__CLIENT_ID_HEADER`, default `X-Session-ID`) > generated UUID. Explicit ids must be valid UUIDs; session identities are opaque tokens mapped deterministically to a UUID. Stable client identity → same conversation; no identity → fresh conversation per request. The resolved id is echoed via `X-Conversation-ID` and never forwarded upstream.
+- **Full-history idempotency**: clients that resend the whole conversation each turn only get the new suffix persisted. Divergent history is rejected with HTTP 409 `history_conflict` before inference — raw history is never rewritten.
+- PostgreSQL unavailable → passthrough continues in degraded mode (nothing persisted, `/healthz` reports `database: degraded`).
 - **Token counting + dynamic budgeting**: heuristic counter (~4 chars/token); `usable = model_limit − safety_margin`; when messages exceed the budget the oldest complete interaction units are dropped (system prompts and the current request are never sacrificed; tool calls stay attached to their results). Impossible requests get OpenAI error `context_length_exceeded` (HTTP 400) instead of being forwarded.
 
 Still ahead (M3+): memory service, hybrid retrieval, compaction, context selection.

@@ -19,6 +19,7 @@ from context_proxy.conversation.identity import (
     InvalidConversationId,
     resolve_conversation_id,
 )
+from context_proxy.conversation.store import HistoryDivergenceError
 from context_proxy.providers.errors import ContextProxyError
 
 router = APIRouter()
@@ -59,7 +60,7 @@ async def chat_completions(request: Request):
         )
 
     try:
-        conversation_id, payload = resolve_conversation_id(request, payload)
+        conversation_id, payload = resolve_conversation_id(request, payload, settings)
     except InvalidConversationId as exc:
         return openai_error(
             str(exc),
@@ -69,16 +70,29 @@ async def chat_completions(request: Request):
         )
     extra_headers = _conversation_headers(conversation_id)
 
-    # 1. Persist raw inbound messages (source of truth). Degraded mode skips.
+    # 1. Persist raw inbound messages (source of truth, §29 step 3). Full-history
+    #    clients resend the whole conversation: only the new suffix is appended;
+    #    divergent histories are rejected before any inference call (M2.1 §1).
+    #    Degraded mode (no store) skips persistence entirely.
     if store is not None:
         try:
             await store.ensure_conversation(conversation_id)
-            await store.append_messages(conversation_id, payload.get("messages") or [])
+            await store.reconcile_history(conversation_id, payload.get("messages") or [])
+        except HistoryDivergenceError as exc:
+            return openai_error(
+                str(exc),
+                err_type="invalid_request_error",
+                code="history_conflict",
+                status_code=409,
+                headers=extra_headers,
+            )
         except Exception as exc:  # noqa: BLE001 - degradation is intentional (§31)
             logger.warning("inbound_persistence_failed", extra={"error": str(exc)})
             store = None
 
     # 2. Budget the raw recent window; never exceed the usable budget (§15).
+    # pinned_budget_tokens is reserved now so M3+ pinned injection cannot
+    # silently push the final context over budget.
     messages = payload.get("messages") or []
     tools = payload.get("tools")
     try:
@@ -86,6 +100,7 @@ async def chat_completions(request: Request):
             messages,
             tools=tools,
             usable_budget=settings.context.usable_budget_tokens,
+            reserved_tokens=settings.context.pinned_budget_tokens,
         )
     except ContextOverflowError as exc:
         return openai_error(
@@ -98,9 +113,9 @@ async def chat_completions(request: Request):
         )
     out_payload = {**payload, "messages": plan.messages}
 
-    async def persist_assistant(message: dict | None) -> None:
+    async def persist_assistant(message: dict | None, metadata: dict | None = None) -> None:
         if store is not None and message is not None:
-            await store.append_messages(conversation_id, [message])
+            await store.append_messages(conversation_id, [message], metadata=metadata)
 
     if payload.get("stream") is True:
         try:
@@ -121,8 +136,18 @@ async def chat_completions(request: Request):
 
     if store is not None and 200 <= status_code < 300:
         try:
-            message = json.loads(body)["choices"][0]["message"]
-            await persist_assistant(message)
+            parsed = json.loads(body)
+            message = parsed["choices"][0]["message"]
+            metadata = {
+                key: value
+                for key, value in (
+                    ("finish_reason", parsed["choices"][0].get("finish_reason")),
+                    ("usage", parsed.get("usage")),
+                    ("model", parsed.get("model")),
+                )
+                if value is not None
+            }
+            await persist_assistant(message, metadata or None)
         except Exception as exc:  # noqa: BLE001 - opaque passthrough first
             logger.warning("assistant_persistence_failed", extra={"error": str(exc)})
 

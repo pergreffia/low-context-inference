@@ -21,11 +21,28 @@ class FakeConversationStore:
         self.conversations.setdefault(conversation_id, [])
 
     async def append_messages(
-        self, conversation_id: str, messages: list[dict[str, Any]]
+        self,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+        metadata: dict | None = None,
     ) -> list[str]:
         bucket = self.conversations.setdefault(conversation_id, [])
         bucket.extend(messages)
         return [f"msg-{len(bucket)}" for _ in messages]
+
+    async def reconcile_history(
+        self, conversation_id: str, messages: list[dict[str, Any]]
+    ) -> list[str]:
+        from context_proxy.conversation.store import HistoryDivergenceError
+
+        persisted = self.conversations.setdefault(conversation_id, [])
+        overlap = min(len(persisted), len(messages))
+        for index in range(overlap):
+            if persisted[index] != messages[index]:
+                raise HistoryDivergenceError(conversation_id, index)
+        if len(messages) <= len(persisted):
+            return []
+        return await self.append_messages(conversation_id, messages[len(persisted):])
 
     async def get_messages(self, conversation_id: str) -> list[dict[str, Any]]:
         return list(self.conversations.get(conversation_id, []))
@@ -178,3 +195,123 @@ def _app_with(settings, handler, store):
         llm_client=_httpx.AsyncClient(base_url=base_url, transport=_httpx.MockTransport(handler)),
         store=store,
     )
+
+
+def test_divergent_history_rejected_before_inference():
+    """10.3 at route level: 409, upstream untouched, DB untouched."""
+    store = FakeConversationStore()
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=CHAT_RESPONSE)
+
+    client = client_for_handler(handler, store=store)
+    conv = "66666666-6666-6666-6666-666666666666"
+    with client:
+        client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "A"}],
+                "conversation_id": conv,
+            },
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "X"}],
+                "conversation_id": conv,
+            },
+        )
+
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "history_conflict"
+    assert len(calls) == 1  # second request never reached upstream
+    assert [(m["role"], m["content"]) for m in store.conversations[conv]] == [
+        ("user", "A"),
+        ("assistant", "hello"),  # response to the first (valid) turn
+    ]
+
+
+def test_full_history_three_turns_idempotent_route_level():
+    """10.1 at route level."""
+    store = FakeConversationStore()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=CHAT_RESPONSE)
+
+    client = client_for_handler(handler, store=store)
+    conv = "88888888-8888-8888-8888-888888888888"
+    with client:
+        h1 = [{"role": "user", "content": "u1"}]
+        h2 = [*h1, {"role": "assistant", "content": "hello"}, {"role": "user", "content": "u2"}]
+        h3 = [*h2, {"role": "assistant", "content": "hello"}, {"role": "user", "content": "u3"}]
+        for history in (h1, h2, h3):
+            r = client.post(
+                "/v1/chat/completions",
+                json={"model": "m", "messages": history, "conversation_id": conv},
+            )
+            assert r.status_code == 200
+
+    # 5 logical inbound messages; assistant responses appended after each turn
+    contents = [(m["role"], m["content"]) for m in store.conversations[conv]]
+    assert contents == [
+        ("user", "u1"),
+        ("assistant", "hello"),  # persisted response to turn 1
+        ("user", "u2"),
+        ("assistant", "hello"),  # response to turn 2 (CHAT_RESPONSE content)
+        ("user", "u3"),
+        ("assistant", "hello"),
+    ]
+
+
+def test_stable_client_identity_gives_continuity():
+    """10.5: same X-Session-ID -> same conversation; different -> separate."""
+    store = FakeConversationStore()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=CHAT_RESPONSE)
+
+    client = client_for_handler(handler, store=store)
+    with client:
+        r1 = client.post(
+            "/v1/chat/completions", json=chat_payload(), headers={"X-Session-ID": "sess-A"}
+        )
+        r2 = client.post(
+            "/v1/chat/completions", json=chat_payload(), headers={"X-Session-ID": "sess-A"}
+        )
+        r3 = client.post(
+            "/v1/chat/completions", json=chat_payload(), headers={"X-Session-ID": "sess-B"}
+        )
+
+    conv_a = r1.headers["X-Conversation-ID"]
+    assert r2.headers["X-Conversation-ID"] == conv_a
+    assert len(store.conversations) == 2
+    assert r3.headers["X-Conversation-ID"] != conv_a
+
+
+def test_non_streaming_metadata_persisted():
+    store = FakeConversationStore()
+    metadata_calls: list[dict] = []
+    original_append = store.append_messages
+
+    async def tracking_append(cid, msgs, metadata=None):
+        if metadata:
+            metadata_calls.append(metadata)
+        return await original_append(cid, msgs, metadata)
+
+    store.append_messages = tracking_append  # type: ignore[method-assign]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={**CHAT_RESPONSE, "model": "test-model", "usage": {"total_tokens": 7}},
+        )
+
+    client = client_for_handler(handler, store=store)
+    with client:
+        r = client.post("/v1/chat/completions", json=chat_payload())
+    assert r.status_code == 200
+    assert any(m.get("finish_reason") == "stop" and m.get("usage") for m in metadata_calls)
