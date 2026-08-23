@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -40,7 +41,9 @@ class HashingEmbedder:
         for text in texts:
             vec = [0.0] * 6
             for token in text.lower().split():
-                vec[hash(token) % 6] += 1.0
+                digest = hashlib.sha256(token.encode("utf-8")).digest()
+                bucket = int.from_bytes(digest[:4], "big") % 6
+                vec[bucket] += 1.0
             norm = sum(v * v for v in vec) ** 0.5 or 1.0
             out.append([v / norm for v in vec])
         return out

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -47,7 +48,9 @@ class HashingEmbedder(OpenAICompatibleEmbeddingProvider):
         for text in texts:
             vec = [0.0] * 6
             for token in text.lower().split():
-                vec[hash(token) % 6] += 1.0
+                digest = hashlib.sha256(token.encode("utf-8")).digest()
+                bucket = int.from_bytes(digest[:4], "big") % 6
+                vec[bucket] += 1.0
             norm = sum(v * v for v in vec) ** 0.5 or 1.0
             out.append([v / norm for v in vec])
         return out
@@ -963,16 +966,36 @@ def test_stale_pending_chunk_and_new_chunk_processed_independently():
             # complete B and add C's question (C becomes the new trailing turn)
             await store.append_messages(conv, [{"role": "assistant", "content": "B answer"}])
             await store.append_messages(conv, [{"role": "user", "content": "C question"}])
-            a_calls = vectors.per_point.copy()
+            ids_before = await pool.fetch(
+                """
+                SELECT start_seq, id FROM conversation_chunks
+                WHERE conversation_id = $1::uuid
+                """,
+                uuid.UUID(conv),
+            )
+            id_by_start_before = {r["start_seq"]: str(r["id"]) for r in ids_before}
+            a_chunk_id = id_by_start_before[0]
+            a_upserts_before = vectors.per_point.get(a_chunk_id, 0)
             await memory.index_completed_turns(conv)
 
             st = await states()
-            assert st[0] is True   # B... i.e. seq0 retried
-            assert st[2] is True   # C(newly completed B-turn) chunked+indexed
-            assert set(vectors.per_point) - set(a_calls) >= {"0"} or True
-            # A's point was NOT re-upserted beyond its single successful attempt
-            for pid, n in a_calls.items():
-                assert vectors.per_point.get(pid, 0) >= n
+            assert st[0] is True   # pending chunk A successfully retried
+            assert st[2] is True   # newly completed B-turn chunked + indexed
+
+            ids_by_start = await pool.fetch(
+                """
+                SELECT start_seq, id FROM conversation_chunks
+                WHERE conversation_id = $1::uuid
+                """,
+                uuid.UUID(conv),
+            )
+            id_by_start = {r["start_seq"]: str(r["id"]) for r in ids_by_start}
+            a_id, b_id = a_chunk_id, id_by_start[2]
+
+            # A: exactly one failed attempt before + exactly one successful retry
+            assert vectors.per_point[a_id] == a_upserts_before + 1
+            # B: brand-new chunk indexed exactly once
+            assert vectors.per_point[b_id] == 1
         finally:
             await pool.close()
 
