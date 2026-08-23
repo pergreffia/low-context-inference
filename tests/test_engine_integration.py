@@ -422,3 +422,120 @@ def test_chunk_structural_span_populated():
             await pool.close()
 
     asyncio.run(_run())
+
+
+def test_chunk_span_exact_message_boundaries():
+    """end_seq = LAST message of the unit, start_seq = first (final review §4)."""
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            memory, store = _services(pool)
+            conv = str(uuid.uuid4())
+            inbound = [
+                {"role": "user", "content": "turn one question"},       # seq 0
+                {"role": "assistant", "content": "turn one answer"},    # seq 1
+                {"role": "assistant", "content": "turn one final"},     # seq 2
+                {"role": "user", "content": "turn two"},                # seq 3
+                {"role": "assistant", "content": "turn two answer"},    # seq 4
+                {"role": "user", "content": "live"},                    # seq 5
+            ]
+            await store.reconcile_history(conv, inbound)
+            await memory.index_completed_turns(conv)
+            rows = await pool.fetch(
+                """
+                SELECT start_seq, end_seq FROM conversation_chunks
+                WHERE conversation_id = $1::uuid ORDER BY start_seq
+                """,
+                conv,
+            )
+            spans = [(r["start_seq"], r["end_seq"]) for r in rows]
+            # multi-message chunk: end covers the FINAL message, not the first
+            assert spans == [(0, 2), (3, 4)]
+            for start, end in spans:
+                assert start <= end
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_vector_store_outage_degrades_to_lexical():
+    """Expected VectorStoreError -> lexical leg continues, logged (#Test A)."""
+    async def _run():
+        import logging
+
+        from context_proxy.memory.errors import VectorStoreError
+
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            class OutageVectorStore(RecordingVectorStore):
+                async def search(self, vector, limit, conversation_id=None):
+                    raise VectorStoreError("qdrant search failed: connection refused")
+
+            conv = str(uuid.uuid4())
+            memory = MemoryService(
+                pool,
+                HashingEmbedder(),
+                OutageVectorStore(),
+                retrieval_settings=RetrievalSettings(),
+            )
+            await memory.create_memory(
+                MemoryCreate(
+                    kind=MemoryKind.FACT,
+                    content="zebra fallback marker",
+                    conversation_id=conv,
+                )
+            )
+            records: list[logging.LogRecord] = []
+
+            class Capture(logging.Handler):
+                def emit(self, record):
+                    records.append(record)
+
+            logger = logging.getLogger("context_proxy.memory.service")
+            handler = Capture()
+            old_level = logger.level
+            logger.addHandler(handler)
+            logger.setLevel(logging.WARNING)
+            try:
+                items = await memory.retrieve("zebra fallback", conv)
+            finally:
+                logger.removeHandler(handler)
+                logger.setLevel(old_level)
+
+            assert any("zebra fallback marker" in i.content for i in items)
+            assert any(r.message == "vector_search_unavailable" for r in records)
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_vector_programming_bug_propagates():
+    """TypeError from the vector store must NOT become degradation (#Test B).
+
+    Fails if a broad `except Exception` is reintroduced around vector search.
+    """
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            class BuggyVectorStore(RecordingVectorStore):
+                async def search(self, vector, limit, conversation_id=None):
+                    raise TypeError("programming bug")
+
+            memory = MemoryService(
+                pool,
+                HashingEmbedder(),
+                BuggyVectorStore(),
+                retrieval_settings=RetrievalSettings(),
+            )
+            try:
+                await memory.retrieve("anything", str(uuid.uuid4()))
+            except TypeError:
+                pass  # expected propagation
+            else:
+                pytest.fail("TypeError was swallowed as vector degradation")
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())

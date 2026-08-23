@@ -155,6 +155,39 @@ class TestRequestSeparation:
         _, current = separate_current_request(messages)
         assert [m["role"] for m in current] == ["user", "assistant", "tool", "assistant"]
 
+
+class TestSeparateBoundaries:
+    """Structural split contract, explicit (final review §6)."""
+
+    def test_empty_input(self):
+        assert separate_current_request([]) == ([], [])
+
+    def test_system_only(self):
+        # Established interaction-unit contract: the trailing unit is the live
+        # interaction. A lone system message therefore IS the trailing unit.
+        history, current = separate_current_request([{"role": "system", "content": "s"}])
+        assert history == []
+        assert current == [{"role": "system", "content": "s"}]
+
+    def test_system_plus_user(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+        ]
+        history, current = separate_current_request(messages)
+        assert history == [{"role": "system", "content": "sys"}]
+        assert current == [{"role": "user", "content": "question"}]
+
+    def test_no_loss_roundtrip(self):
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+        ]
+        history, current = separate_current_request(messages)
+        assert history + current == messages
+
     def test_current_request_exactly_once_even_if_repeated_in_history(self):
         history = [
             {"role": "user", "content": "same text"},
@@ -642,6 +675,16 @@ class TestAtomicity:
             plan = make_engine(usable_budget=usable).build(
                 history=history, current_request=current
             )
+            sources_list = sources(plan)
+            # exactly one atomic CURRENT_REQUEST candidate — never split into
+            # CURRENT_REQUEST + RECENT_TURN, never duplicated (final review §5)
+            assert sources_list.count("current_request") == 1
+            request_item = next(
+                s for s in plan.selected_items if s.source.value == "current_request"
+            )
+            assert request_item.key == "current_request"
+            assert request_item.tokens == make_engine()._counter.messages(current)
+            assert_whole_units(plan.messages, [history[:2], history, current])
             roles = [m["role"] for m in plan.messages]
             if "tool" in roles:
                 idx = roles.index("tool")

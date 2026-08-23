@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from context_proxy.memory.errors import VectorStoreError
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,7 +67,12 @@ class QdrantVectorStore:
         limit: int,
         conversation_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return [{id, score, payload}] ordered by descending similarity."""
+        """Return [{id, score, payload}] ordered by descending similarity.
+
+        Transport/timeouts/HTTP failures raise VectorStoreError so callers can
+        degrade deliberately; unexpected errors (bad payloads, bugs) propagate
+        untouched (M4 final review §1).
+        """
         body: dict[str, Any] = {"vector": list(vector), "limit": limit, "with_payload": True}
         if conversation_id is not None:
             body["filter"] = {
@@ -76,8 +83,17 @@ class QdrantVectorStore:
                     }
                 ]
             }
-        response = await self._client.post(
-            f"/collections/{self._collection}/points/search", json=body
-        )
-        response.raise_for_status()
-        return response.json().get("result", [])
+        try:
+            response = await self._client.post(
+                f"/collections/{self._collection}/points/search", json=body
+            )
+            response.raise_for_status()
+            result = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            # ValueError covers non-JSON bodies; anything else is a real bug.
+            raise VectorStoreError(
+                f"qdrant search failed: {exc}", cause=exc
+            ) from exc
+        if not isinstance(result, dict) or not isinstance(result.get("result", []), list):
+            raise VectorStoreError("qdrant search returned malformed payload")
+        return result.get("result", [])

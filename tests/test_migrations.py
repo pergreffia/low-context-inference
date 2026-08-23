@@ -45,6 +45,8 @@ def test_migrations_idempotent_and_schema_present():
         "0004_memory_foundations.sql",
         "0005_index_watermark.sql",
         "0006_vector_state.sql",
+        "0007_chunk_end_seq.sql",
+        "0008_chunk_span_not_null.sql",
     } <= applied | set(first)
     assert second == []  # never reapplied within a single process
     expected = {
@@ -216,6 +218,7 @@ def test_concurrent_startup_applies_each_exactly_once():
                 "0005_index_watermark.sql",
                 "0006_vector_state.sql",
                 "0007_chunk_end_seq.sql",
+                "0008_chunk_span_not_null.sql",
             }
             # every migration applied exactly once across both runners
             assert len(names) == len(set(names))
@@ -261,7 +264,7 @@ def test_migrations_from_clean_database_create_full_m3_schema():
                 await pool.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
 
             completed = await apply_migrations(pool)
-            assert len(completed) == 7
+            assert len(completed) == 8
 
             cols = await pool.fetch(
                 """
@@ -290,6 +293,25 @@ def test_migrations_from_clean_database_create_full_m3_schema():
             )
             names = {r["indexname"] for r in indexes}
             assert "uq_chunks_conversation_start_seq" in names
+
+            constraints = await pool.fetch(
+                """
+                SELECT conname FROM pg_constraint
+                WHERE conrelid = 'conversation_chunks'::regclass AND contype = 'c'
+                """
+            )
+            assert {"ck_chunks_end_gte_start"} <= {
+                r["conname"] for r in constraints
+            }
+
+            null_end = await pool.fetchval(
+                """
+                SELECT count(*) FROM information_schema.columns
+                WHERE table_name='conversation_chunks'
+                  AND column_name='end_seq' AND is_nullable='YES'
+                """
+            )
+            assert null_end == 0
 
             gin = await pool.fetch(
                 """

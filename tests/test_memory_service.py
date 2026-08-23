@@ -11,6 +11,7 @@ import pytest
 
 from context_proxy.config import EndpointSettings, RetrievalSettings
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
+from context_proxy.memory.errors import VectorStoreError
 from context_proxy.memory.models import MemoryCreate, MemoryKind
 from context_proxy.memory.qdrant import QdrantVectorStore
 from context_proxy.memory.service import MemoryService
@@ -340,16 +341,16 @@ def test_weights_change_ranking_order():
 
 
 class BrokenVectorStore(QdrantVectorStore):
-    """Simulates a Qdrant outage."""
+    """Simulates a Qdrant outage via the typed infrastructure error."""
 
     def __init__(self):
         super().__init__("offline://none")
 
     async def search(self, vector, limit, conversation_id=None):
-        raise RuntimeError("qdrant down")
+        raise VectorStoreError("qdrant down")
 
     async def upsert(self, points, vector_size):
-        raise RuntimeError("qdrant down")
+        raise VectorStoreError("qdrant down")
 
 
 def test_supersession_rejects_cross_conversation_target():

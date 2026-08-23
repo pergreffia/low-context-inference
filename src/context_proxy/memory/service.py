@@ -22,7 +22,7 @@ import asyncpg
 from context_proxy.config import RetrievalSettings
 from context_proxy.context.tokens import TokenCounter
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
-from context_proxy.memory.errors import RetrievalError
+from context_proxy.memory.errors import RetrievalError, VectorStoreError
 from context_proxy.memory.models import TYPE_PRIORITY, MemoryCreate, MemoryStatus, RetrievedItem
 from context_proxy.memory.qdrant import QdrantVectorStore
 
@@ -385,7 +385,9 @@ class MemoryService:
                     key = str(payload.get("chunk_id") or payload.get("memory_id") or "")
                     if key:
                         semantic_scores[key] = min(1.0, max(0.0, float(hit["score"])))
-            except Exception as exc:  # noqa: BLE001 - degrade to lexical (§31)
+            except VectorStoreError as exc:
+                # Expected vector-store outage: degrade to lexical (§10.4).
+                # Programming errors from the store propagate untouched.
                 logger.warning("vector_search_unavailable", extra={"error": str(exc)})
 
         # PostgreSQL legs are typed-failure territory: an expected database
