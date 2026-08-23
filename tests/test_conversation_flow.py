@@ -31,7 +31,10 @@ class FakeConversationStore:
         return [f"msg-{len(bucket)}" for _ in messages]
 
     async def reconcile_history(
-        self, conversation_id: str, messages: list[dict[str, Any]]
+        self,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+        metadata: dict | None = None,
     ) -> list[str]:
         from context_proxy.conversation.store import HistoryDivergenceError
 
@@ -295,14 +298,14 @@ def test_stable_client_identity_gives_continuity():
 def test_non_streaming_metadata_persisted():
     store = FakeConversationStore()
     metadata_calls: list[dict] = []
-    original_append = store.append_messages
+    original_reconcile = store.reconcile_history
 
-    async def tracking_append(cid, msgs, metadata=None):
+    async def tracking_reconcile(cid, msgs, metadata=None):
         if metadata:
             metadata_calls.append(metadata)
-        return await original_append(cid, msgs, metadata)
+        return await original_reconcile(cid, msgs, metadata)
 
-    store.append_messages = tracking_append  # type: ignore[method-assign]
+    store.reconcile_history = tracking_reconcile  # type: ignore[method-assign]
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

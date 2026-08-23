@@ -114,8 +114,19 @@ async def chat_completions(request: Request):
     out_payload = {**payload, "messages": plan.messages}
 
     async def persist_assistant(message: dict | None, metadata: dict | None = None) -> None:
+        """Persist the assistant response via reconciliation.
+
+        Concurrent identical requests each produce a real inference response;
+        only the FIRST response reconciles cleanly. Later ones diverge at the
+        assistant index and are skipped (warning) so the stored history never
+        contains duplicate fabricated replies.
+        """
         if store is not None and message is not None:
-            await store.append_messages(conversation_id, [message], metadata=metadata)
+            await store.reconcile_history(
+                conversation_id,
+                [*messages, message],
+                metadata=metadata,
+            )
 
     if payload.get("stream") is True:
         try:

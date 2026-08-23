@@ -251,7 +251,7 @@ def test_streaming_route_persists_full_state_and_passthrough_bytes():
         async def ensure_conversation(self, cid):
             self.conversations.setdefault(cid, [])
 
-        async def reconcile_history(self, cid, msgs):
+        async def reconcile_history(self, cid, msgs, metadata=None):
             bucket = self.conversations.setdefault(cid, [])
             overlap = min(len(bucket), len(msgs))
             for index in range(overlap):
@@ -259,12 +259,11 @@ def test_streaming_route_persists_full_state_and_passthrough_bytes():
                     from context_proxy.conversation.store import HistoryDivergenceError
 
                     raise HistoryDivergenceError(cid, index)
-            bucket.extend(msgs[len(bucket):])
-            return []
-
-        async def append_messages(self, cid, msgs, metadata=None):
-            store_events.append((msgs[0] if msgs else None, metadata or {}))
-            self.conversations.setdefault(cid, []).extend(msgs)
+            suffix = msgs[len(bucket):]
+            if not suffix:
+                return []
+            store_events.append((suffix[0], metadata or {}))
+            bucket.extend(suffix)
             return []
 
         async def get_messages(self, cid):
