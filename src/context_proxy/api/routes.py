@@ -114,7 +114,7 @@ async def chat_completions(request: Request):
     out_payload = {**payload, "messages": plan.messages}
 
     async def persist_assistant(message: dict | None, metadata: dict | None = None) -> None:
-        """Best-effort assistant persistence (M2.3 §1–§3).
+        """Best-effort assistant persistence + memory indexing (M2.3/M3).
 
         Concurrent identical requests each produce a real inference response;
         only the FIRST continuation reconciles cleanly. A loser diverges at the
@@ -122,6 +122,8 @@ async def chat_completions(request: Request):
         is appended, and the already-generated upstream response still reaches
         its client untouched. Expected conflicts and unexpected failures get
         distinct structured events; neither alters the HTTP response.
+        Indexing completed turns runs after persistence and can never affect
+        the response either.
         """
         if store is None or message is None:
             return
@@ -139,6 +141,7 @@ async def chat_completions(request: Request):
                     "index": exc.index,
                 },
             )
+            return
         except Exception as exc:  # noqa: BLE001 - passthrough first, always
             logger.warning(
                 "assistant_persistence_failed",
@@ -146,6 +149,26 @@ async def chat_completions(request: Request):
                     "conversation_id": conversation_id,
                     "error": str(exc),
                 },
+            )
+            return
+        await index_memory(conversation_id)
+
+    async def index_memory(conversation_id: str) -> None:
+        """Chunk+index completed turns; best-effort, never breaks responses."""
+        memory = getattr(app_state, "memory", None)
+        if memory is None or not settings.memory.auto_index:
+            return
+        try:
+            created = await memory.index_completed_turns(conversation_id)
+            if created:
+                logger.info(
+                    "turns_indexed",
+                    extra={"conversation_id": conversation_id, "chunks": created},
+                )
+        except Exception as exc:  # noqa: BLE001 - degradation by design
+            logger.warning(
+                "memory_index_failed",
+                extra={"conversation_id": conversation_id, "error": str(exc)},
             )
 
     if payload.get("stream") is True:

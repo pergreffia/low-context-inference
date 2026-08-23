@@ -37,6 +37,29 @@ class ConversationSettings(BaseModel):
     max_session_identity_chars: int = Field(default=128, gt=0)
 
 
+class QdrantSettings(BaseModel):
+    base_url: str = "http://localhost:6333"
+    collection: str = "context_proxy"
+    timeout_seconds: float = Field(default=5.0, gt=0)
+
+
+class RetrievalSettings(BaseModel):
+    """Hybrid retrieval scoring (master prompt §19). Weights configurable."""
+
+    semantic_weight: float = 0.40
+    lexical_weight: float = 0.25
+    recency_weight: float = 0.15
+    importance_weight: float = 0.15
+    type_weight: float = 0.05
+    limit_default: int = Field(default=8, ge=1)
+    candidate_pool: int = Field(default=50, ge=1)
+
+
+class MemorySettings(BaseModel):
+    auto_index: bool = True  # chunk+index completed turns after each response
+    max_embed_chars: int = Field(default=8000, gt=0)
+
+
 class ContextSettings(BaseModel):
     """Context budget configuration (master prompt §14, §15).
 
@@ -68,6 +91,9 @@ class Settings(BaseSettings):
     context: ContextSettings = ContextSettings()
     conversation: ConversationSettings = ConversationSettings()
     inference: EndpointSettings = EndpointSettings()
+    qdrant: QdrantSettings = QdrantSettings()
+    retrieval: RetrievalSettings = RetrievalSettings()
+    memory: MemorySettings = MemorySettings()
     compact: EndpointSettings = EndpointSettings(
         base_url="http://localhost:8001/v1",
         api_key="local",

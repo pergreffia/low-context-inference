@@ -38,7 +38,12 @@ def test_migrations_idempotent_and_schema_present():
 
     first, second, applied, tables = asyncio.run(_run())
     # Re-runnable: on a fresh DB first applies everything, otherwise it is empty.
-    assert {"0001_init.sql", "0002_tool_result_integrity.sql"} <= applied | set(first)
+    assert {
+        "0001_init.sql",
+        "0002_tool_result_integrity.sql",
+        "0003_message_metadata.sql",
+        "0004_memory_foundations.sql",
+    } <= applied | set(first)
     assert second == []  # never reapplied within a single process
     expected = {
         "schema_migrations",
@@ -205,6 +210,7 @@ def test_concurrent_startup_applies_each_exactly_once():
                 "0001_init.sql",
                 "0002_tool_result_integrity.sql",
                 "0003_message_metadata.sql",
+                "0004_memory_foundations.sql",
             }
             # every migration applied exactly once across both runners
             assert len(names) == len(set(names))
