@@ -14,28 +14,32 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-async def _run_twice() -> tuple[list[str], list[str]]:
-    from context_proxy.db.database import apply_migrations
-
-    pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
-    try:
-        first = await apply_migrations(pool)
-        second = await apply_migrations(pool)
-        tables = {
-            row["tablename"]
-            for row in await pool.fetch(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-            )
-        }
-        return first, second, tables  # type: ignore[return-value]
-    finally:
-        await pool.close()
-
-
 def test_migrations_idempotent_and_schema_present():
-    first, second, tables = asyncio.run(_run_twice())
-    assert {"0001_init.sql", "0002_tool_result_integrity.sql"} <= set(first)
-    assert second == []
+    async def _run():
+        from context_proxy.db.database import apply_migrations
+
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            first = await apply_migrations(pool)
+            second = await apply_migrations(pool)
+            applied = {
+                row["name"]
+                for row in await pool.fetch("SELECT name FROM schema_migrations")
+            }
+            tables = {
+                row["tablename"]
+                for row in await pool.fetch(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                )
+            }
+            return first, second, applied, tables  # type: ignore[return-value]
+        finally:
+            await pool.close()
+
+    first, second, applied, tables = asyncio.run(_run())
+    # Re-runnable: on a fresh DB first applies everything, otherwise it is empty.
+    assert {"0001_init.sql", "0002_tool_result_integrity.sql"} <= applied | set(first)
+    assert second == []  # never reapplied within a single process
     expected = {
         "schema_migrations",
         "conversations",

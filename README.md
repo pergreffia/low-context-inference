@@ -4,20 +4,15 @@ Model-agnostic context management proxy exposing an OpenAI-compatible API. Lets 
 
 See `context-proxy-master-prompt.md` for the full design.
 
-## Status: M1 — Foundation
+## Status: M2 — Conversation Management
 
-Implemented:
+M1 foundation plus:
 
-- repository structure, project configuration;
-- provider abstractions (`ConversationStore`, `MemoryStore`, `VectorStore`, `EmbeddingProvider`, `LLMProvider`, `CompactProvider`);
-- PostgreSQL schema + idempotent migrations (source of truth);
-- Docker Compose skeleton (context-proxy, postgres, qdrant);
-- basic OpenAI-compatible proxy:
-  - `GET /v1/models` — passthrough;
-  - `POST /v1/chat/completions` — passthrough, streaming (SSE) and non-streaming;
-  - `/healthz`.
+- **Raw persistence** (PostgreSQL, source of truth): conversations, messages (verbatim JSONB), tool calls/results with relational integrity. The original conversation is always reconstructable.
+- **Conversation identification**: pass `X-Conversation-ID` header or a `conversation_id` body field; the id is echoed back via `X-Conversation-ID` response header and never forwarded upstream. Without it, each request is an isolated conversation. PostgreSQL unavailable → passthrough continues in degraded mode (nothing persisted).
+- **Token counting + dynamic budgeting**: heuristic counter (~4 chars/token); `usable = model_limit − safety_margin`; when messages exceed the budget the oldest complete interaction units are dropped (system prompts and the current request are never sacrificed; tool calls stay attached to their results). Impossible requests get OpenAI error `context_length_exceeded` (HTTP 400) instead of being forwarded.
 
-Not yet implemented (later milestones): conversation persistence logic, memory service, retrieval, compaction.
+Still ahead (M3+): memory service, hybrid retrieval, compaction, context selection.
 
 ## Local development
 

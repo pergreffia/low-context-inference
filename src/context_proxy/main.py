@@ -8,6 +8,7 @@ from fastapi import FastAPI
 
 from context_proxy.api.routes import router
 from context_proxy.config import Settings, load_settings
+from context_proxy.conversation.store import PostgresConversationStore
 from context_proxy.db.database import Database
 from context_proxy.providers.llm import OpenAICompatibleLLMProvider
 
@@ -19,6 +20,7 @@ def create_app(
     *,
     llm_client: httpx.AsyncClient | None = None,
     database: Database | None = None,
+    store=None,
 ) -> FastAPI:
     settings = settings or load_settings()
     database = database or Database(settings.database)
@@ -27,6 +29,13 @@ def create_app(
     async def lifespan(app: FastAPI):
         await database.start()
         app.state.database = database
+        if store is not None:
+            # Test/injected store wins over the database-backed one.
+            app.state.store = store
+        elif database.available and database.pool is not None:
+            app.state.store = PostgresConversationStore(database.pool)
+        else:
+            app.state.store = None
         yield
         await database.close()
 

@@ -78,12 +78,14 @@ def client_for_handler(
     handler,
     *,
     model: str | None = None,
+    store=None,
     raise_server_exceptions: bool = True,
 ) -> TestClient:
     settings = make_settings(model=model)
     app = create_app(
         settings,
         llm_client=httpx.AsyncClient(base_url=UPSTREAM, transport=httpx.MockTransport(handler)),
+        store=store,
     )
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
