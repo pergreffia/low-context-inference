@@ -226,35 +226,33 @@ def record_stage(request, name: str, started_monotonic: float) -> None:
 
 
 async def _drain_body(receive, max_body_bytes: int) -> tuple[list[dict], bool]:
-    """Consume request messages, buffering up to max_body_bytes.
+    """Buffer request messages up to max_body_bytes; stop AT first violation.
 
-    Returns (buffered_messages, exceeded). When exceeded the remaining body is
-    drained (discarded) so the client can finish sending, and the caller must
-    answer 413 instead of invoking the application.
+    Returns (buffered_messages, exceeded). When exceeded the middleware
+    answers 413 immediately WITHOUT consuming any further request messages:
+    continuing to read arbitrarily large bodies would waste bandwidth/CPU and
+    hold connections open (M5 final review §1). The ASGI server is then
+    responsible for closing the connection after our short response.
+
+    A client disconnect mid-body yields the bytes received so far terminated
+    by a synthetic end-of-body message; the application sees a short body.
     """
     buffered: list[dict] = []
     total = 0
-    exceeded = False
     while True:
         message = await receive()
         if message["type"] == "http.disconnect":
-            return buffered, True
+            buffered.append({"type": "http.request", "body": b"", "more_body": False})
+            return buffered, False
         if message["type"] != "http.request":
-            if exceeded:
-                continue  # keep draining protocol noise until terminal message
-            buffered.append(message)
-            if not message.get("more_body"):
-                return buffered, False
             continue
-        body = message.get("body") or b""
-        total += len(body)
-        if not exceeded and total > max_body_bytes:
-            exceeded = True
-            buffered = []  # discard; never forwarded downstream
-        elif not exceeded:
-            buffered.append(message)
+        total += len(message.get("body") or b"")
+        if total > max_body_bytes:
+            # Hard stop: no further receive() consumption of an oversized body.
+            return [], True
+        buffered.append(message)
         if not message.get("more_body"):
-            return buffered, exceeded
+            return buffered, False
 
 
 def _replaying_receive(messages: list[dict], original_receive):

@@ -448,32 +448,29 @@ class TestBodyLimitWithoutContentLength:
     def test_asgi_level_limit_without_content_length_header(self):
         """Pure-ASGI proof: no Content-Length header, oversized streamed body.
 
-        Contract: the middleware drains the body itself, never runs the
-        application when the cap is exceeded, and answers 413.
+        Contract (final review §1): the middleware stops consuming the body
+        AT the first violating chunk — no further receive() calls — never
+        runs the application, and answers 413.
         """
         from context_proxy.observability.middleware import ObservabilityMiddleware
 
         reached_app = {"flag": False}
-        received_messages: list[dict] = []
 
         async def app(scope, receive, send):  # pragma: no cover - must NOT run
             reached_app["flag"] = True
             while True:
                 message = await receive()
-                received_messages.append(message)
                 if not message.get("more_body"):
                     break
             await send({"type": "http.response.start", "status": 200, "headers": []})
             await send({"type": "http.response.body", "body": b""})
 
         sent_messages: list[dict] = []
-
-        async def send(message):
-            sent_messages.append(message)
-
-        body_parts = [b"a" * 100, b"b" * 100]
+        receive_calls = {"n": 0}
+        body_parts = [b"a" * 100, b"b" * 100]  # second chunk crosses limit=150
 
         async def receive():
+            receive_calls["n"] += 1
             if body_parts:
                 part = body_parts.pop(0)
                 return {
@@ -482,6 +479,9 @@ class TestBodyLimitWithoutContentLength:
                     "more_body": bool(body_parts),
                 }
             return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent_messages.append(message)
 
         scope = {
             "type": "http",
@@ -495,12 +495,54 @@ class TestBodyLimitWithoutContentLength:
         middleware = ObservabilityMiddleware(app, max_body_bytes=150)
         asyncio.run(middleware(scope, receive, send))
 
-        assert reached_app["flag"] is False  # application never ran
-        assert received_messages == []       # no body ever forwarded
-        start = next(m for m in sent_messages if m["type"] == "http.response.start")
-        assert start["status"] == 413
+        assert reached_app["flag"] is False   # application never ran
+        starts = [m for m in sent_messages if m["type"] == "http.response.start"]
+        assert len(starts) == 1 and starts[0]["status"] == 413
+        assert receive_calls["n"] == 2        # stopped AT the violating chunk
 
-    def test_asgi_level_under_limit_replays_body_to_app(self):
+    def test_asgi_limit_stops_reading_on_huge_body(self):
+        """A body far beyond the cap triggers an immediate stop (review §2).
+
+        200 chunks of 100 bytes against a 150-byte cap: detection happens on
+        the SECOND chunk; the remaining ~198 chunks are NEVER consumed.
+        """
+        from context_proxy.observability.middleware import ObservabilityMiddleware
+
+        total_chunks = 200
+        receive_calls = {"n": 0}
+        remaining = {"count": total_chunks}
+
+        async def receive():
+            receive_calls["n"] += 1
+            remaining["count"] -= 1
+            more = remaining["count"] > 0
+            return {"type": "http.request", "body": b"x" * 100, "more_body": more}
+
+        async def app(scope, receive, send):  # pragma: no cover - must NOT run
+            raise AssertionError("application must not run for oversized bodies")
+
+        sent_statuses: list[int] = []
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                sent_statuses.append(message["status"])
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("test", 123),
+            "state": {},
+        }
+
+        middleware = ObservabilityMiddleware(app, max_body_bytes=150)
+        asyncio.run(middleware(scope, receive, send))
+
+        assert sent_statuses == [413]
+        assert receive_calls["n"] == 2  # NOT all {total_chunks} messages
+
+    def test_asgi_under_limit_replays_body_to_app(self):
         """Under the cap: app runs and receives the exact buffered body."""
         from context_proxy.observability.middleware import ObservabilityMiddleware
 
@@ -619,3 +661,60 @@ class TestRateLimiterIdentityPolicy:
         assert first.status_code == 200
         assert second.status_code == 429  # bucket A exhausted...
         assert other.status_code == 200   # ...bucket B untouched
+
+
+class TestTokenAccountingStreamingWithStore:
+    """Streaming through the persistence path: exactly-once (final review §3-§4)."""
+
+    @staticmethod
+    def _store(reconcile_raises: Exception | None = None):
+        class Store:
+            def __init__(self):
+                self.calls = 0
+
+            async def ensure_conversation(self, conversation_id):
+                return None
+
+            async def reconcile_history(self, conversation_id, messages, metadata=None):
+                self.calls += 1
+                if reconcile_raises is not None:
+                    raise reconcile_raises
+                return []
+
+        return Store()
+
+    def test_streaming_with_store_counts_once(self):
+        handler = TestTokenAccountingExactlyOnce._handler(with_usage=True)
+        llm_client = httpx.AsyncClient(
+            base_url=UPSTREAM, transport=httpx.MockTransport(handler)
+        )
+        store = self._store()
+        app = create_app(make_settings(), llm_client=llm_client, store=store)
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions", json={**CHAT_BODY, "stream": True}
+            )
+            counters = TestTokenAccountingExactlyOnce._token_counters(client)
+        assert response.status_code == 200
+        assert response.text.endswith("data: [DONE]\n\n")
+        # persistence path taken: inbound reconciliation + assistant capture
+        assert store.calls == 2
+        assert counters == {"prompt": 5, "completion": 2}  # NOT 10/4
+
+    def test_streaming_with_store_failure_counts_once_and_stream_survives(self):
+        handler = TestTokenAccountingExactlyOnce._handler(with_usage=True)
+        llm_client = httpx.AsyncClient(
+            base_url=UPSTREAM, transport=httpx.MockTransport(handler)
+        )
+        store = self._store(reconcile_raises=RuntimeError("persistence down"))
+        app = create_app(make_settings(), llm_client=llm_client, store=store)
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions", json={**CHAT_BODY, "stream": True}
+            )
+            counters = TestTokenAccountingExactlyOnce._token_counters(client)
+        assert response.status_code == 200
+        # stream reached the client COMPLETE despite the persistence failure
+        assert "data: [DONE]" in response.text
+        # accounting happened exactly once even though persistence failed
+        assert counters == {"prompt": 5, "completion": 2}
