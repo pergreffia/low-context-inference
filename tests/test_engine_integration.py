@@ -15,9 +15,10 @@ import asyncpg
 import pytest
 
 from context_proxy.config import AssemblySettings, EndpointSettings, RetrievalSettings
-from context_proxy.context.engine import ContextAssemblyEngine
+from context_proxy.context.engine import ContextAssemblyEngine, separate_current_request
 from context_proxy.conversation.store import PostgresConversationStore
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
+from context_proxy.memory.errors import RetrievalError
 from context_proxy.memory.models import MemoryCreate, MemoryKind
 from context_proxy.memory.qdrant import QdrantVectorStore
 from context_proxy.memory.service import MemoryService
@@ -139,8 +140,10 @@ def test_superseded_memory_never_reaches_plan():
             ]
             await store.ensure_conversation(conv)
             retrieved = await memory.retrieve("deploy target", conv)
+            history, current = separate_current_request(messages)
             plan = _engine().build(
-                messages=messages,
+                history=history,
+                current_request=current,
                 retrieved=retrieved,
                 conversation_id=conv,
             )
@@ -181,8 +184,12 @@ def test_conversation_isolation_in_assembled_plan():
             ]
             for conv, forbidden in ((conv_a, "xylophone"), (conv_b, "orangutan")):
                 retrieved = await memory.retrieve("secret keyword", conv)
+                history, current = separate_current_request(messages)
                 plan = _engine().build(
-                    messages=messages, retrieved=retrieved, conversation_id=conv
+                    history=history,
+                    current_request=current,
+                    retrieved=retrieved,
+                    conversation_id=conv,
                 )
                 blob = "\n".join(m.get("content") or "" for m in plan.messages)
                 assert forbidden not in blob
@@ -212,8 +219,12 @@ def test_chunk_dedup_against_persisted_recent_window():
             # The client replays full history; chunks covering it must dedup.
             inbound = [*history, current]
             retrieved = await memory.retrieve("retry timeout policy", conv)
+            history_msgs, current_msgs = separate_current_request(inbound)
             plan = _engine().build(
-                messages=inbound, retrieved=retrieved, conversation_id=conv
+                history=history_msgs,
+                current_request=current_msgs,
+                retrieved=retrieved,
+                conversation_id=conv,
             )
             rendered = [m.get("content") or "" for m in plan.messages]
             chunk_blocks = [
@@ -263,11 +274,150 @@ def test_lexical_fallback_feeds_engine_when_semantic_leg_down():
                 {"role": "user", "content": "deploy rules?"},
             ]
             retrieved = await broken.retrieve("deploy", conv)  # lexical only
+            history, current = separate_current_request(messages)
             plan = _engine().build(
-                messages=messages, retrieved=retrieved, conversation_id=conv
+                history=history,
+                current_request=current,
+                retrieved=retrieved,
+                conversation_id=conv,
             )
             blob = "\n".join(m.get("content") or "" for m in plan.messages)
             assert "never deploy on fridays" in blob
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_raw_history_unchanged_after_dedup():
+    """A memory duplicating a turn is dropped from the request only (#12)."""
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            memory, store = _services(pool)
+            conv = str(uuid.uuid4())
+            inbound = [
+                {"role": "user", "content": "we chose SQLite for the edge cache"},
+                {"role": "assistant", "content": "noted"},
+                {"role": "user", "content": "current question"},
+            ]
+            await store.reconcile_history(conv, inbound)
+            await memory.create_memory(
+                MemoryCreate(
+                    kind=MemoryKind.FACT,
+                    content="we chose SQLite for the edge cache",
+                    conversation_id=conv,
+                    importance=0.8,
+                )
+            )
+            retrieved = await memory.retrieve("edge cache", conv)
+            assert any(i.item_type == "memory" for i in retrieved)
+
+            history, current = separate_current_request(inbound)
+            plan = _engine().build(
+                history=history,
+                current_request=current,
+                retrieved=retrieved,
+                conversation_id=conv,
+            )
+            dup_dropped = any(
+                d.reason == "duplicate" for d in plan.dropped_items
+            )
+            assert dup_dropped, "restating memory must be dropped as duplicate"
+            rendered = "\n".join(m.get("content") or "" for m in plan.messages)
+            # exactly one copy survives (the raw turn), dedup or no dedup
+            assert rendered.count("edge cache") >= 1
+
+            # authoritative state untouched regardless
+            persisted = await store.get_messages(conv)
+            assert persisted == inbound
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_identical_repeated_messages_stay_separate_rows():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            _, store = _services(pool)
+            conv = str(uuid.uuid4())
+            repeated = {"role": "user", "content": "run the tests"}
+            inbound = [
+                repeated,
+                {"role": "assistant", "content": "ok"},
+                repeated,
+                {"role": "assistant", "content": "ok again"},
+            ]
+            first = await store.reconcile_history(conv, inbound)
+            replay = await store.reconcile_history(conv, inbound)  # idempotent
+            assert replay == []
+            assert len(first) == 4
+            rows = await pool.fetch(
+                "SELECT content FROM messages WHERE conversation_id = $1::uuid ORDER BY seq",
+                conv,
+            )
+            contents = [r["content"] for r in rows]
+            assert contents.count(json_content(repeated)) == 2
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def json_content(message: dict) -> str:
+    import json
+
+    return json.dumps(message, ensure_ascii=False)
+
+
+def test_pg_outage_raises_typed_retrieval_error():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        memory, _store = _services(pool)
+        conv = str(uuid.uuid4())
+        await pool.close()  # simulate PostgreSQL outage
+        try:
+            await memory.retrieve("anything", conv)
+        except RetrievalError:
+            pass  # expected typed failure
+        else:
+            pytest.fail("expected RetrievalError, got success")
+        # programming errors are NOT converted (no broad except upstream)
+
+    asyncio.run(_run())
+
+
+def test_chunk_structural_span_populated():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            memory, store = _services(pool)
+            conv = str(uuid.uuid4())
+            inbound = [
+                {"role": "user", "content": "first topic"},
+                {"role": "assistant", "content": "answer one"},
+                {"role": "user", "content": "second topic"},
+                {"role": "assistant", "content": "answer two"},
+                {"role": "user", "content": "live"},
+            ]
+            await store.reconcile_history(conv, inbound)
+            await memory.index_completed_turns(conv)
+            rows = await pool.fetch(
+                """
+                SELECT start_seq, end_seq FROM conversation_chunks
+                WHERE conversation_id = $1::uuid ORDER BY start_seq
+                """,
+                conv,
+            )
+            assert len(rows) == 2
+            for row in rows:
+                assert row["start_seq"] is not None
+                assert row["end_seq"] is not None
+                assert row["end_seq"] > row["start_seq"]
+            # spans tile the settled range contiguously
+            assert rows[0]["end_seq"] < rows[1]["start_seq"]
         finally:
             await pool.close()
 

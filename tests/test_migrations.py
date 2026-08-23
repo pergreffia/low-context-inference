@@ -215,6 +215,7 @@ def test_concurrent_startup_applies_each_exactly_once():
                 "0004_memory_foundations.sql",
                 "0005_index_watermark.sql",
                 "0006_vector_state.sql",
+                "0007_chunk_end_seq.sql",
             }
             # every migration applied exactly once across both runners
             assert len(names) == len(set(names))
@@ -260,20 +261,21 @@ def test_migrations_from_clean_database_create_full_m3_schema():
                 await pool.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
 
             completed = await apply_migrations(pool)
-            assert len(completed) == 6
+            assert len(completed) == 7
 
             cols = await pool.fetch(
                 """
                 SELECT table_name, column_name FROM information_schema.columns
                 WHERE table_schema = 'public'
                   AND column_name IN (
-                      'start_seq', 'ts', 'last_chunked_seq',
+                      'start_seq', 'end_seq', 'ts', 'last_chunked_seq',
                       'supersedes', 'superseded_by'
                   )
                 """
             )
             have = {(c["table_name"], c["column_name"]) for c in cols}
             assert ("conversation_chunks", "start_seq") in have
+            assert ("conversation_chunks", "end_seq") in have
             assert ("conversation_chunks", "ts") in have
             assert ("memory_records", "ts") in have
             assert ("conversations", "last_chunked_seq") in have

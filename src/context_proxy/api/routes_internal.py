@@ -15,6 +15,9 @@ from pydantic import BaseModel, Field
 from context_proxy.context.engine import (
     ContextOverflowError as EngineContextOverflowError,
 )
+from context_proxy.context.engine import separate_current_request
+from context_proxy.context.query import extract_retrieval_query
+from context_proxy.memory.errors import RetrievalError
 from context_proxy.memory.models import (
     MemoryCreate,
     RetrievalResponse,
@@ -106,23 +109,21 @@ async def context_preview(
     if engine is None:
         raise HTTPException(status_code=503, detail="context engine unavailable")
 
+    history, current_request = separate_current_request(body.messages)
+
     retrieved = []
     memory = getattr(request.app.state, "memory", None)
-    if memory is not None and body.messages:
-        query_parts = [
-            m.get("content") or ""
-            for m in reversed(body.messages)
-            if m.get("role") == "user" and isinstance(m.get("content"), str)
-        ]
-        if query_parts:
-            try:
-                retrieved = await memory.retrieve(query_parts[0], parsed)
-            except Exception:  # noqa: BLE001 - preview degrades exactly like prod
-                retrieved = []
+    query = extract_retrieval_query(body.messages)  # same helper as production
+    if memory is not None and query:
+        try:
+            retrieved = await memory.retrieve(query, parsed)
+        except RetrievalError:  # expected failure — preview degrades like prod
+            retrieved = []
 
     try:
         plan = engine.build(
-            messages=body.messages,
+            history=history,
+            current_request=current_request,
             tools=body.tools,
             retrieved=retrieved,
             conversation_id=str(parsed),

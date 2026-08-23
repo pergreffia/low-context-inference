@@ -70,6 +70,10 @@ class RetrievedItem(BaseModel):
     score: float
     components: dict[str, float] = Field(default_factory=dict)
     source_message_ids: list[str] = Field(default_factory=list)
+    # Structural identity for chunks (authoritative message seq range);
+    # memories have no position in the raw sequence.
+    start_seq: int | None = None
+    end_seq: int | None = None
 
 
 class RetrievalResponse(BaseModel):

@@ -27,10 +27,13 @@ Category precedence when the budget is insufficient (§11.7, §11.8):
     4. recent raw turns, newest first       (freshest raw truth)
     5. retrieved memories/chunks, MMR order (derived, most disposable)
 
-Recent turns pack as ONE contiguous newest-side window: when an old unit no
-longer fits, everything older is dropped too. Contiguous history beats
-maximal fill. Under pressure recent raw context displaces retrieved blocks —
-the documented trade-off, not an accident.
+The current request is STRUCTURALLY distinct from history: `build` takes it
+as a separate argument and models it as exactly one mandatory atomic
+candidate that can never be re-selected as a recent turn. Recent turns pack
+as ONE contiguous newest-side window; when an old unit no longer fits,
+everything older is dropped too. Contiguous history beats maximal fill.
+Under pressure recent raw context displaces retrieved blocks — the
+documented trade-off, not an accident.
 """
 
 from __future__ import annotations
@@ -50,7 +53,7 @@ from context_proxy.context.candidates import (
     message_texts,
 )
 from context_proxy.context.mmr import cosine_similarity, mmr_select
-from context_proxy.context.planner import segment_messages
+from context_proxy.context.planner import Unit, segment_messages
 from context_proxy.context.scoring import relevance_score
 from context_proxy.context.tokens import TokenCounter
 from context_proxy.memory.models import RetrievedItem
@@ -58,6 +61,27 @@ from context_proxy.memory.models import RetrievedItem
 logger = logging.getLogger(__name__)
 
 _RETRIEVAL_SOURCES = frozenset({CandidateSource.MEMORY, CandidateSource.CHUNK})
+
+CURRENT_REQUEST_KEY = "current_request"
+
+
+def separate_current_request(
+    messages: list[dict[str, Any]],
+    counter: TokenCounter | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split an inbound payload into (history, current_request).
+
+    The current request is the trailing interaction unit (the one starting at
+    the last user message, including any attached tool calls/results).
+    Structural separation: history candidates can never contain it and it can
+    never be duplicated as a recent turn.
+    """
+    units = segment_messages(messages, counter or TokenCounter())
+    if not units:
+        return [], []
+    tail = units[-1]
+    flattened_history = [m for unit in units[:-1] for m in unit.messages]
+    return flattened_history, list(tail.messages)
 
 
 class ContextOverflowError(Exception):
@@ -154,15 +178,23 @@ class ContextAssemblyEngine:
     def build(
         self,
         *,
-        messages: list[dict[str, Any]],
+        history: list[dict[str, Any]],
+        current_request: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         pinned: list[dict[str, Any]] | None = None,
         retrieved: list[RetrievedItem] | None = None,
         superseded_memory_ids: set[str] | None = None,
         conversation_id: str | None = None,
     ) -> ContextPlan:
-        """Assemble the final upstream message list within the usable budget."""
-        fused = self._fuse_candidates(messages, tools, pinned, retrieved or [])
+        """Assemble the final upstream message list within the usable budget.
+
+        `history` and `current_request` are structurally disjoint: the engine
+        models the request as exactly one mandatory atomic candidate and
+        never re-derives it from the history tail.
+        """
+        fused = self._fuse_candidates(
+            history, current_request, tools, pinned, retrieved or []
+        )
 
         dropped: dict[str, DroppedCandidate] = {}
         fused = self._filter_superseded(fused, superseded_memory_ids or set(), dropped)
@@ -190,22 +222,19 @@ class ContextAssemblyEngine:
 
     def _fuse_candidates(
         self,
-        messages: list[dict[str, Any]],
+        history: list[dict[str, Any]],
+        current_request: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         pinned: list[dict[str, Any]] | None,
         retrieved: list[RetrievedItem],
     ) -> list[Candidate]:
         candidates: list[Candidate] = []
 
-        units = segment_messages(messages, self._counter)
+        units: list[Unit] = segment_messages(history, self._counter)
         for index, unit in enumerate(units):
-            if unit.is_system:
-                source = CandidateSource.SYSTEM
-            elif index == len(units) - 1:
-                # The trailing unit carries the live request.
-                source = CandidateSource.CURRENT_REQUEST
-            else:
-                source = CandidateSource.RECENT_TURN
+            source = (
+                CandidateSource.SYSTEM if unit.is_system else CandidateSource.RECENT_TURN
+            )
             candidates.append(
                 Candidate(
                     source=source,
@@ -223,6 +252,20 @@ class ContextAssemblyEngine:
                             for m in unit.messages
                         ],
                     },
+                )
+            )
+
+        # The current request is exactly one atomic mandatory candidate.
+        if current_request:
+            candidates.append(
+                Candidate(
+                    source=CandidateSource.CURRENT_REQUEST,
+                    key=CURRENT_REQUEST_KEY,
+                    tokens=self._counter.messages(current_request),
+                    tier=TIER_BY_SOURCE[CandidateSource.CURRENT_REQUEST],
+                    render=tuple(current_request),
+                    text=canonical_text(message_texts(current_request)),
+                    metadata={"position": len(units)},
                 )
             )
 

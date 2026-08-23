@@ -17,6 +17,7 @@ exclusively to assemble the upstream request.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -138,6 +139,11 @@ def candidate_from_retrieved(item: RetrievedItem, counter: TokenCounter) -> Cand
     Supersession enforcement lives upstream of this projection: the memory
     service only returns active records (PostgreSQL status filter) and the
     engine additionally drops any id listed as superseded by the caller.
+
+    Identity (M4 review §6): chunks carry their authoritative message span
+    (conversation_id + start_seq/end_seq); memories carry a stable content
+    fingerprint. Identical content is NOT identical authoritative history —
+    raw interactions are only ever matched through their stored spans.
     """
     label = f"[{item.item_type}:{item.kind} {item.id}]"
     content = f"{label} {item.content}"
@@ -166,5 +172,14 @@ def candidate_from_retrieved(item: RetrievedItem, counter: TokenCounter) -> Cand
             "kind": item.kind,
             "score": item.score,
             "dedup_text": dedup_text,
+            "fingerprint": content_fingerprint(dedup_text),
+            "start_seq": item.start_seq,
+            "end_seq": item.end_seq,
         },
     )
+
+
+def content_fingerprint(text: str) -> str:
+    """Stable fingerprint of canonical content for derived candidates."""
+    digest = hashlib.sha256(canonical_text(text).encode("utf-8")).hexdigest()
+    return digest[:16]

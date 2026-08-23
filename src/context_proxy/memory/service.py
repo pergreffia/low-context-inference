@@ -22,6 +22,7 @@ import asyncpg
 from context_proxy.config import RetrievalSettings
 from context_proxy.context.tokens import TokenCounter
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
+from context_proxy.memory.errors import RetrievalError
 from context_proxy.memory.models import TYPE_PRIORITY, MemoryCreate, MemoryStatus, RetrievedItem
 from context_proxy.memory.qdrant import QdrantVectorStore
 
@@ -242,13 +243,14 @@ class MemoryService:
         return await conn.fetchval(
             """
             INSERT INTO conversation_chunks
-                (conversation_id, start_seq, message_ids, raw_content, token_count)
-            VALUES ($1::uuid, $2, $3::uuid[], $4, $5)
+                (conversation_id, start_seq, end_seq, message_ids, raw_content, token_count)
+            VALUES ($1::uuid, $2, $3, $4::uuid[], $5, $6)
             ON CONFLICT (conversation_id, start_seq) DO NOTHING
             RETURNING id
             """,
             conversation_id,
             start_seq,
+            unit_rows[-1]["seq"],
             message_ids,
             raw_content,
             token_count,
@@ -386,16 +388,24 @@ class MemoryService:
             except Exception as exc:  # noqa: BLE001 - degrade to lexical (§31)
                 logger.warning("vector_search_unavailable", extra={"error": str(exc)})
 
-        lexical = await self._lexical_search(query, conversation_id, pool_size)
-        max_rank = max((h["rank"] for h in lexical), default=0.0)
+        # PostgreSQL legs are typed-failure territory: an expected database
+        # outage becomes RetrievalError (degradable), while programming errors
+        # (TypeError, AttributeError, ...) propagate untouched (§18).
+        try:
+            lexical = await self._lexical_search(query, conversation_id, pool_size)
+            max_rank = max((h["rank"] for h in lexical), default=0.0)
 
-        candidates: dict[str, dict[str, Any]] = {
-            hit["id"]: hit for hit in lexical
-        }
-        # semantic-only hits need their source rows fetched from PostgreSQL
-        missing = [k for k in semantic_scores if k not in candidates]
-        if missing:
-            candidates.update(await self._fetch_by_ids(conversation_id, missing))
+            candidates: dict[str, dict[str, Any]] = {
+                hit["id"]: hit for hit in lexical
+            }
+            # semantic-only hits need their source rows fetched from PostgreSQL
+            missing = [k for k in semantic_scores if k not in candidates]
+            if missing:
+                candidates.update(await self._fetch_by_ids(conversation_id, missing))
+        except (asyncpg.PostgresError, asyncpg.InterfaceError) as exc:
+            raise RetrievalError(
+                f"lexical retrieval unavailable: {exc}", cause=exc
+            ) from exc
 
         now = now_utc()
         items: list[RetrievedItem] = []
@@ -432,6 +442,8 @@ class MemoryService:
                     score=round(score, 6),
                     components=components,
                     source_message_ids=[str(x) for x in row.get("source_message_ids") or []],
+                    start_seq=row.get("start_seq"),
+                    end_seq=row.get("end_seq"),
                 )
             )
         items.sort(key=lambda i: (-i.score, i.id))
@@ -465,10 +477,12 @@ class MemoryService:
                 "created_at": r["created_at"],
                 "source_message_ids": r["source_message_ids"] or [],
                 "rank": 0.0,
+                "start_seq": None,
+                "end_seq": None,
             }
         chunk_rows = await self._pool.fetch(
             """
-            SELECT id, raw_content, created_at, message_ids
+            SELECT id, raw_content, created_at, message_ids, start_seq, end_seq
             FROM conversation_chunks
             WHERE conversation_id = $1::uuid AND id = ANY($2::uuid[])
             """,
@@ -484,6 +498,8 @@ class MemoryService:
                 "created_at": r["created_at"],
                 "source_message_ids": [str(x) for x in (r["message_ids"] or [])],
                 "rank": 0.0,
+                "start_seq": r["start_seq"],
+                "end_seq": r["end_seq"],
             }
         return out
 
@@ -512,12 +528,14 @@ class MemoryService:
                 "created_at": r["created_at"],
                 "source_message_ids": r["source_message_ids"] or [],
                 "rank": float(r["rank"]),
+                "start_seq": None,
+                "end_seq": None,
             }
             for r in rows
         ]
         chunk_rows = await self._pool.fetch(
             f"""
-            SELECT id, raw_content, created_at, message_ids,
+            SELECT id, raw_content, created_at, message_ids, start_seq, end_seq,
                    ts_rank(ts, {ts_query}) AS rank
             FROM conversation_chunks
             WHERE conversation_id = $1::uuid AND ts @@ {ts_query}
@@ -535,6 +553,8 @@ class MemoryService:
                 "created_at": r["created_at"],
                 "source_message_ids": [str(x) for x in (r["message_ids"] or [])],
                 "rank": float(r["rank"]),
+                "start_seq": r["start_seq"],
+                "end_seq": r["end_seq"],
             }
             for r in chunk_rows
         ]

@@ -14,14 +14,19 @@ from context_proxy.api.responses import (
     upstream_response,
 )
 from context_proxy.capture import PersistingLLMStream
-from context_proxy.context.engine import ContextOverflowError as EngineOverflowError
+from context_proxy.context.engine import (
+    ContextOverflowError as EngineOverflowError,
+)
+from context_proxy.context.engine import separate_current_request
 from context_proxy.context.planner import ContextOverflowError, plan_context
+from context_proxy.context.query import extract_retrieval_query
 from context_proxy.conversation.identity import (
     RESPONSE_CONVERSATION_HEADER,
     InvalidConversationId,
     resolve_conversation_id,
 )
 from context_proxy.conversation.store import HistoryDivergenceError
+from context_proxy.memory.errors import RetrievalError
 from context_proxy.providers.errors import ContextProxyError
 
 router = APIRouter()
@@ -32,24 +37,6 @@ def _conversation_headers(conversation_id: str | None) -> dict[str, str]:
     if conversation_id is None:
         return {}
     return {RESPONSE_CONVERSATION_HEADER: conversation_id}
-
-
-def _retrieval_query(messages: list[dict]) -> str:
-    """Text of the latest user message; multimodal parts contribute their text."""
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return " ".join(
-                str(part.get("text") or "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ).strip()
-        return ""
-    return ""
 
 
 @router.get("/v1/models")
@@ -111,12 +98,14 @@ async def chat_completions(request: Request):
             store = None
 
     # 2. Assemble the model context within the usable budget (M4 §11).
-    #    When the Context Assembly Engine is available it fuses recent raw
-    #    turns with best-effort retrieval (memories/chunks, conversation-
-    #    scoped, active-only), deduplicates, applies MMR diversity, and packs
-    #    the result into a deterministic ContextPlan. Otherwise the M2 raw
-    #    window planner is used. Both paths guarantee: never exceed budget,
-    #    current request preserved, atomic interaction units.
+    #    The inbound payload is structurally split into history and the
+    #    current request: the engine models the request exactly once, as a
+    #    mandatory atomic candidate. When the Context Assembly Engine is
+    #    available it fuses recent raw turns with best-effort retrieval
+    #    (memories/chunks, conversation-scoped, active-only), deduplicates,
+    #    applies MMR diversity, and packs a deterministic ContextPlan.
+    #    Otherwise the M2 raw window planner is used. Both paths guarantee:
+    #    never exceed budget, current request preserved, atomic units.
     messages = payload.get("messages") or []
     tools = payload.get("tools")
     engine = getattr(app_state, "context_engine", None)
@@ -124,18 +113,20 @@ async def chat_completions(request: Request):
         if engine is not None:
             retrieved: list = []
             memory = getattr(app_state, "memory", None)
-            if memory is not None and messages:
-                query = _retrieval_query(messages)
-                if query:
-                    try:
-                        retrieved = await memory.retrieve(query, conversation_id)
-                    except Exception as exc:  # noqa: BLE001 - degrade to raw-only (§10.4)
-                        logger.warning(
-                            "context_retrieval_failed",
-                            extra={"conversation_id": conversation_id, "error": str(exc)},
-                        )
+            query = extract_retrieval_query(messages)
+            if memory is not None and query:
+                try:
+                    retrieved = await memory.retrieve(query, conversation_id)
+                except RetrievalError as exc:
+                    # Expected retrieval failure: degrade to raw/recent only.
+                    logger.warning(
+                        "context_retrieval_failed",
+                        extra={"conversation_id": conversation_id, "error": str(exc)},
+                    )
+            history, current_request = separate_current_request(messages)
             plan = engine.build(
-                messages=messages,
+                history=history,
+                current_request=current_request,
                 tools=tools,
                 retrieved=retrieved,
                 conversation_id=conversation_id,
