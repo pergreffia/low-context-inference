@@ -577,8 +577,11 @@ def test_streaming_concurrent_assistant_conflicts_keep_streams_intact(caplog):
                 with caplog.at_level(logging.WARNING, logger="context_proxy.request"):
                     bodies = await asyncio.gather(consume(client), consume(client))
 
-            # both streams delivered completely, each its own response
+            # both streams delivered completely, each preserving its own
+            # upstream response (order-independent: X vs Y scheduling varies)
             assert all(b.endswith(b"data: [DONE]\n\n") for b in bodies)
+            assert any(b'"content":"X"' in body for body in bodies)
+            assert any(b'"content":"Y"' in body for body in bodies)
             assert {b for b in bodies} and len(bodies) == 2
 
             persisted = await store.get_messages(conv)
