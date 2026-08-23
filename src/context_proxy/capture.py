@@ -16,6 +16,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from context_proxy.conversation.store import HistoryDivergenceError
 from context_proxy.providers.base import LLMStream
 
 logger = logging.getLogger(__name__)
@@ -163,5 +164,16 @@ class PersistingLLMStream:
                 logger.warning("assistant_stream_incomplete_persistence_skipped")
             try:
                 await self._on_finished(message, metadata)
-            except Exception as exc:  # noqa: BLE001 - persistence must not break streaming
-                logger.warning("assistant_persistence_failed", extra={"error": str(exc)})
+            except HistoryDivergenceError as exc:
+                # Classification guard: the route callback normally handles this
+                # itself; if a raw reconciliation callback ever lets one escape,
+                # it must still NOT be misclassified as a persistence failure.
+                logger.warning(
+                    "assistant_persistence_conflict",
+                    extra={"conversation_id": exc.conversation_id, "index": exc.index},
+                )
+            except Exception as exc:  # noqa: BLE001 - passthrough first, always
+                logger.warning(
+                    "assistant_persistence_failed",
+                    extra={"error": str(exc)},
+                )
