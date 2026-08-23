@@ -65,29 +65,93 @@ def canonical_text(value: str) -> str:
     return _WHITESPACE.sub(" ", value).strip().lower()
 
 
+def _image_fingerprint(url: str) -> str:
+    """Short stable fingerprint of an image payload for identity purposes."""
+    import hashlib
+
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
+
+
 def message_texts(messages: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> str:
     """Role+content projection of a message list, order-preserving.
 
     Used both for candidate rendering and canonical comparison, so a chunk
     storing JSON-lines of persisted messages compares equal to the recent
     window holding the same interaction.
+
+    Multimodal parts (M6 §13.1): text parts contribute their text; image
+    parts contribute a short content fingerprint — two interactions with the
+    same text but different images must NOT collapse into one identity.
     """
     parts: list[str] = []
     for message in messages:
+        role = message.get("role")
         content = message.get("content")
+        if isinstance(content, str):
+            parts.append(f"{role}: {content}")
+            continue
         if isinstance(content, list):
-            content = " ".join(
-                str(part.get("text") or "")
-                for part in content
-                if isinstance(part, dict)
-            )
-        parts.append(f"{message.get('role')}: {content if isinstance(content, str) else ''}")
+            rendered: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                kind = part.get("type")
+                if kind == "text":
+                    rendered.append(str(part.get("text") or ""))
+                elif kind == "image_url":
+                    image_url = part.get("image_url") or {}
+                    url = (
+                        image_url.get("url", "")
+                        if isinstance(image_url, dict)
+                        else str(image_url)
+                    )
+                    rendered.append(f"[image:{_image_fingerprint(str(url))}]")
+                else:
+                    rendered.append(f"[{kind or 'unknown'}]")
+            parts.append(f"{role}: " + " ".join(rendered))
+            continue
+        parts.append(f"{role}: ")
         for tool_call in message.get("tool_calls") or []:
             function = tool_call.get("function") or {}
             parts.append(
                 f"tool_call: {function.get('name')} {function.get('arguments')}"
             )
     return "\n".join(parts)
+
+
+def content_texts(message: dict[str, Any]) -> list[str]:
+    """Canonical per-part texts of ONE message (dedup keys, M6-aware).
+
+    Text parts contribute their text; image parts contribute their
+    fingerprint token so identical-text/different-image interactions keep
+    distinct identities.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        text_value = canonical_text(content)
+        return [text_value] if text_value else []
+    if isinstance(content, list):
+        out: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                text_value = canonical_text(str(part.get("text") or ""))
+                if text_value:
+                    out.append(text_value)
+            elif kind == "image_url":
+                image_url = part.get("image_url") or {}
+                url = (
+                    image_url.get("url", "")
+                    if isinstance(image_url, dict)
+                    else str(image_url)
+                )
+                out.append(f"[image:{_image_fingerprint(str(url))}]")
+            else:
+                out.append(f"[{kind or 'unknown'}]")
+        return out
+    return []
 
 
 def chunk_canonical_text(raw_content: str) -> str:

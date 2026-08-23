@@ -166,6 +166,7 @@ class PostgresConversationStore:
             )
             message_ids.append(str(message_id))
             await self._persist_tool_parts(conn, conversation_id, message_id, message)
+            await self._persist_media_parts(conn, conversation_id, message_id, message)
         logger.info(
             "messages_persisted",
             extra={"conversation_id": conversation_id, "count": len(message_ids)},
@@ -232,3 +233,52 @@ class PostgresConversationStore:
         """Reconstruct the raw conversation in order."""
         async with self._pool.acquire() as conn:
             return await self._fetch_messages(conn, conversation_id)
+
+    @staticmethod
+    async def _persist_media_parts(
+        conn: asyncpg.Connection,
+        conversation_id: str,
+        message_id,
+        message: dict[str, Any],
+    ) -> None:
+        """Register multimodal parts against their message (M6 §13.2).
+
+        The raw content (including full data URLs) stays verbatim in
+        messages.jsonb; this registry is a queryable index associated with the
+        interaction unit. Insert is idempotent per (message, part_index).
+        """
+        import hashlib
+
+        content = message.get("content")
+        if not isinstance(content, list):
+            return
+        for index, part in enumerate(content):
+            if not isinstance(part, dict):
+                continue  # unknown parts stay opaque in raw storage only
+            kind = part.get("type")
+            if kind != "image_url":
+                continue
+            image_url = part.get("image_url") or {}
+            url = (
+                str(image_url.get("url", ""))
+                if isinstance(image_url, dict)
+                else str(image_url)
+            )
+            source = "data" if url.startswith("data:") else "url"
+            payload_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
+            await conn.execute(
+                """
+                INSERT INTO conversation_media
+                    (conversation_id, message_id, part_index, kind,
+                     source, media_hash, byte_size)
+                VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (message_id, part_index) DO NOTHING
+                """,
+                conversation_id,
+                message_id,
+                index,
+                str(kind),
+                source,
+                payload_hash,
+                len(url),
+            )

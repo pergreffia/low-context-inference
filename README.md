@@ -4,10 +4,23 @@ Model-agnostic context management proxy exposing an OpenAI-compatible API. Lets 
 
 See `context-proxy-master-prompt.md` for the full design.
 
-## Status: M5 — Production Hardening / Operations
+## Status: M6 — Multimodal Transparency (§13.1–§13.3)
+
+M5 hardening plus first-class multimodal support, primary use case: screenshots from coding agents.
+
+- **Content transparency**: `content` may be a string or an array of parts (`text`, `image_url`, `data:` URLs). Parts pass through `client → persistence → context selection → provider` untouched — arrays are never stringified and unknown part types stay opaque instead of being discarded.
+- **Token accounting**: text parts counted as text; image parts use a flat deterministic estimate (`IMAGE_PART_TOKENS = 1024`) so base64 payloads never inflate the budget; unknown parts a flat placeholder.
+- **Persistence**: raw content stays verbatim in `messages.jsonb` — the provider request is always reconstructable exactly, images included. A `conversation_media` registry (migration `0009`) indexes each image part against its message/interaction unit (`source: data|url`, hash, size) for diagnostics and future retrieval.
+- **Interaction atomicity**: `user(text+image) + assistant` is one indivisible unit in the Context Assembly Engine; budget pressure drops it whole, never text-only. Identity fingerprints distinguish same-text/different-image interactions.
+- **Retrieval queries**: only textual parts feed lexical/semantic retrieval; images never leak into query strings.
+
+Not yet implemented (later M6 work per §13.4–§13.5): vision descriptions/OCR, media-derived memories, image/multimodal embeddings, visual score fusion.
+
+## Previous milestones
+
+### M5 — Production Hardening / Operations
 
 M4 context assembly plus operational hardening (`observability/`, `providers/resilience.py`), without changing core semantic behavior:
-
 - **Structured logging**: `SERVER__LOG_JSON=true` for JSON lines; every request carries a correlation id (inbound `X-Request-ID` honored, else generated and echoed); a redaction filter scrubs bearer tokens/api keys from log output.
 - **Metrics**: dependency-free Prometheus text endpoint at `/metrics` — request totals & latency histogram, upstream latency, token accounting (`context_proxy_llm_tokens_total{direction}`), degradation events, rate-limit rejections, circuit state gauge.
 - **Latency breakdown**: per-request stage timings (`inbound_persistence`, `context_assembly`) logged in `request_completed`.
@@ -26,7 +39,9 @@ Not yet implemented: distributed rate limiting/metrics backends, OTel tracing ex
 
 ### M4 — Context Assembly Engine
 
-M3 memory service plus a dedicated **Context Assembly Engine** (`context/engine.py`) that decides what context actually reaches the model:```text
+M3 memory service plus a dedicated **Context Assembly Engine** (`context/engine.py`) that decides what context actually reaches the model:
+
+```text
 candidate fusion → deduplication → supersession filtering
     → relevance scoring → MMR diversity → budget allocation
     → packing → ContextPlan

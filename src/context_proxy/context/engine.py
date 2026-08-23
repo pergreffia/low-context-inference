@@ -50,6 +50,7 @@ from context_proxy.context.candidates import (
     DroppedCandidate,
     candidate_from_retrieved,
     canonical_text,
+    content_texts,
     message_texts,
 )
 from context_proxy.context.mmr import cosine_similarity, mmr_select
@@ -245,11 +246,13 @@ class ContextAssemblyEngine:
                     text=canonical_text(message_texts(list(unit.messages))),
                     metadata={
                         "position": index,
-                        # Bare per-message contents let memory records restating
-                        # a single turn message be recognized as duplicates.
+                        # Bare per-part texts (M6-aware: images contribute
+                        # fingerprint tokens) let memory records restating a
+                        # turn be recognized as duplicates.
                         "content_texts": [
-                            canonical_text(str(m.get("content") or ""))
+                            text
                             for m in unit.messages
+                            for text in content_texts(m)
                         ],
                     },
                 )
