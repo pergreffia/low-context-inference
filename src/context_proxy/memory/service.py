@@ -56,98 +56,156 @@ class MemoryService:
 
     # ------------------------------------------------------------------ chunks
 
-    async def index_completed_turns(self, conversation_id: str) -> int:
-        """Chunk every completed turn not yet indexed; returns chunks created.
+    async def index_completed_turns(self, conversation_id: uuid.UUID | str) -> int:
+        """Chunk every completed turn newer than the watermark; returns chunks.
+
+        Incremental (M3 review §5): only messages with seq > conversations.
+        last_indexed_seq are scanned; after the pass the watermark advances to
+        the newest seen seq. Idempotency is doubly guaranteed: the watermark
+        plus the unique (conversation_id, start_seq) constraint.
 
         A turn = user message plus the following non-user messages (tool calls
-        stay attached to their results). The trailing turn is never chunked —
-        it is still the live recent interaction. System messages are excluded:
-        they remain permanent raw context (priority 1).
+        stay attached to their results). The trailing turn of each pass is
+        never chunked — it is still the live recent interaction. System
+        messages are excluded: they remain permanent raw context.
+
+        Concurrency-safe: takes the conversation row lock so two concurrent
+        indexing passes serialize instead of racing on the watermark.
         """
-        rows = await self._pool.fetch(
-            """
-            SELECT id, seq, role, content FROM messages
-            WHERE conversation_id = $1::uuid AND role <> 'system'
-            ORDER BY seq
-            """,
-            conversation_id,
-        )
-        if not rows:
-            return 0
-        last_seq = rows[-1]["seq"]
-
-        units: list[tuple[int, list[asyncpg.Record]]] = []
-        current: list[asyncpg.Record] = []
-        for row in rows:
-            if row["role"] == "user" and current:
-                units.append((current[0]["seq"], current))
-                current = []
-            current.append(row)
-        if current:
-            units.append((current[0]["seq"], current))
-
-        existing = {
-            r["start_seq"]
-            for r in await self._pool.fetch(
-                "SELECT start_seq FROM conversation_chunks WHERE conversation_id = $1::uuid",
-                conversation_id,
-            )
-        }
-
-        created = 0
-        for start_seq, unit_rows in units:
-            if start_seq in existing:
-                continue  # idempotent replay
-            if unit_rows[-1]["seq"] >= last_seq:
-                continue  # trailing turn = live recent interaction, keep raw
-            created += await self._index_unit(conversation_id, start_seq, unit_rows)
-        return created
-
-    async def _index_unit(
-        self, conversation_id: str, start_seq: int, unit_rows: list[asyncpg.Record]
-    ) -> int:
-        messages = [json.loads(r["content"]) for r in unit_rows]
-        raw_content = "\n".join(json.dumps(m, ensure_ascii=False) for m in messages)
-        token_count = self._counter.messages(messages)
-        message_ids = [str(r["id"]) for r in unit_rows]
-
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
                     "SELECT id FROM conversations WHERE id = $1::uuid FOR UPDATE",
                     conversation_id,
                 )
-                chunk_id = await conn.fetchval(
+                watermark = await conn.fetchval(
+                    "SELECT last_indexed_seq FROM conversations WHERE id = $1::uuid",
+                    conversation_id,
+                )
+                # Window starts at the user message AT OR BEFORE the watermark:
+                # a turn straddling the previous boundary must be reconsidered
+                # once it completed (its chunk insert no-ops if already done).
+                boundary = await conn.fetchval(
                     """
-                    INSERT INTO conversation_chunks
-                        (conversation_id, start_seq, message_ids, raw_content, token_count)
-                    VALUES ($1::uuid, $2, $3::uuid[], $4, $5)
-                    ON CONFLICT (conversation_id, start_seq) DO NOTHING
-                    RETURNING id
+                    SELECT COALESCE(MAX(seq), 0) FROM messages
+                    WHERE conversation_id = $1::uuid AND role = 'user'
+                      AND seq <= COALESCE($2, -1)
                     """,
                     conversation_id,
-                    start_seq,
-                    message_ids,
-                    raw_content,
-                    token_count,
+                    watermark,
                 )
-        if chunk_id is None:
-            return 0  # raced or already present: idempotent no-op
+                rows = await conn.fetch(
+                    """
+                    SELECT id, seq, role, content FROM messages
+                    WHERE conversation_id = $1::uuid AND role <> 'system'
+                      AND seq >= $2
+                    ORDER BY seq
+                    """,
+                    conversation_id,
+                    boundary,
+                )
+                if not rows:
+                    return 0
+
+                units: list[tuple[int, list[asyncpg.Record]]] = []
+                current: list[asyncpg.Record] = []
+                for row in rows:
+                    if row["role"] == "user" and current:
+                        units.append((current[0]["seq"], current))
+                        current = []
+                    current.append(row)
+                if current:
+                    units.append((current[0]["seq"], current))
+
+                # The LAST unit is the live interaction: never chunked now.
+                settled_units = units[:-1]
+                created = 0
+                settled_end: int | None = None
+                for start_seq, unit_rows in settled_units:
+                    chunk_id = await self._insert_chunk(
+                        conn, conversation_id, start_seq, unit_rows
+                    )
+                    if chunk_id is not None:
+                        created += 1
+                    settled_end = unit_rows[-1]["seq"]
+
+                if settled_end is not None and (watermark is None or settled_end > watermark):
+                    await conn.execute(
+                        """
+                        UPDATE conversations SET last_indexed_seq = $2
+                        WHERE id = $1::uuid
+                        """,
+                        conversation_id,
+                        settled_end,
+                    )
+
+        # Vector indexing outside the lock transaction; failures leave rows
+        # rebuildable from PostgreSQL and never abort the pass.
+        for start_seq, unit_rows in settled_units:
+            row_chunk_id = await self._pool.fetchval(
+                """
+                SELECT id FROM conversation_chunks
+                WHERE conversation_id = $1::uuid AND start_seq = $2
+                """,
+                conversation_id,
+                start_seq,
+            )
+            if row_chunk_id is not None:
+                await self._embed_and_upsert_for_rows(
+                    str(row_chunk_id), conversation_id, start_seq, unit_rows
+                )
+        logger.info(
+            "indexing_pass_completed",
+            extra={"conversation_id": conversation_id, "chunks": created},
+        )
+        return created
+
+    async def _insert_chunk(
+        self,
+        conn: asyncpg.Connection,
+        conversation_id: str,
+        start_seq: int,
+        unit_rows: list[asyncpg.Record],
+    ) -> Any:
+        """Insert one turn chunk (caller holds lock+tx); returns new id or None."""
+        messages = [json.loads(r["content"]) for r in unit_rows]
+        raw_content = "\n".join(json.dumps(m, ensure_ascii=False) for m in messages)
+        token_count = self._counter.messages(messages)
+        message_ids = [str(r["id"]) for r in unit_rows]
+        return await conn.fetchval(
+            """
+            INSERT INTO conversation_chunks
+                (conversation_id, start_seq, message_ids, raw_content, token_count)
+            VALUES ($1::uuid, $2, $3::uuid[], $4, $5)
+            ON CONFLICT (conversation_id, start_seq) DO NOTHING
+            RETURNING id
+            """,
+            conversation_id,
+            start_seq,
+            message_ids,
+            raw_content,
+            token_count,
+        )
+
+    async def _embed_and_upsert_for_rows(
+        self,
+        chunk_id: str,
+        conversation_id: str,
+        start_seq: int,
+        unit_rows: list[asyncpg.Record],
+    ) -> None:
+        messages = [json.loads(r["content"]) for r in unit_rows]
+        raw_content = "\n".join(json.dumps(m, ensure_ascii=False) for m in messages)
         await self._embed_and_upsert(
-            point_id=str(chunk_id),
+            point_id=chunk_id,
             text=raw_content,
             payload={
                 "conversation_id": conversation_id,
                 "kind": "chunk",
-                "chunk_id": str(chunk_id),
+                "chunk_id": chunk_id,
                 "start_seq": start_seq,
             },
         )
-        logger.info(
-            "chunk_indexed",
-            extra={"conversation_id": conversation_id, "chunk_id": str(chunk_id)},
-        )
-        return 1
 
     # ---------------------------------------------------------------- memories
 
@@ -173,12 +231,21 @@ class MemoryService:
                 if spec.supersedes:
                     # Pre-check inside the tx: an unknown target is a client
                     # error (404), not a database integrity accident.
-                    target = await conn.fetchval(
-                        "SELECT id FROM memory_records WHERE id = $1::uuid FOR UPDATE",
+                    # Cross-conversation targets are rejected BEFORE any write:
+                    # the target stays untouched and no new memory is created.
+                    target = await conn.fetchrow(
+                        """
+                        SELECT id, conversation_id FROM memory_records
+                        WHERE id = $1::uuid FOR UPDATE
+                        """,
                         uuid.UUID(spec.supersedes),
                     )
                     if target is None:
                         raise ValueError(f"supersedes target {spec.supersedes} not found")
+                    if str(target["conversation_id"]) != spec.conversation_id:
+                        raise ValueError(
+                            "supersedes target belongs to a different conversation"
+                        )
                 await conn.execute(
                     """
                     INSERT INTO memory_records
@@ -226,7 +293,9 @@ class MemoryService:
         return memory_id
 
     async def supersede_memory(
-        self, memory_id: str, status: MemoryStatus = MemoryStatus.OBSOLETE
+        self,
+        memory_id: uuid.UUID | str,
+        status: MemoryStatus = MemoryStatus.OBSOLETE,
     ) -> bool:
         result = await self._pool.execute(
             """
@@ -246,11 +315,12 @@ class MemoryService:
     # --------------------------------------------------------------- retrieval
 
     async def retrieve(
-        self, query: str, conversation_id: str, limit: int | None = None
+        self, query: str, conversation_id: uuid.UUID | str, limit: int | None = None
     ) -> list[RetrievedItem]:
         """Hybrid pipeline (§17): semantic + lexical -> fusion -> metadata
         filtering (same conversation, active memories only = supersession
         filtering) -> weighted ranking (§19)."""
+        conversation_id = str(conversation_id)
         limit = limit or self._retrieval.limit_default
         pool_size = self._retrieval.candidate_pool
 

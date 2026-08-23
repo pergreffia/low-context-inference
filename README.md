@@ -11,6 +11,7 @@ M2 foundation plus:
 - **Turn chunking**: completed interaction turns are automatically chunked (`conversation_chunks`, idempotent via `(conversation_id, start_seq)`); tool calls stay attached to their results; the trailing turn and system prompts stay raw in the recent window.
 - **Memory records**: typed kinds (decision/constraint/fact/task/bug/implementation/…) with importance, source-message traceability, and **supersession** — superseding a decision marks the old record `superseded` (never deleted, only excluded from active retrieval).
 - **Hybrid retrieval**: Qdrant semantic leg + PostgreSQL full-text lexical leg, fused with configurable weights (`RETRIEVAL__*`, master prompt §19), conversation-scoped by payload filter and SQL predicate. Embedding/Qdrant outages degrade to lexical-only; nothing is lost because PostgreSQL is the source of truth and the index is rebuildable.
+- **Indexing latency**: chunking/embedding/vector-upsert run synchronously after the response is persisted but are bounded by `MEMORY__INDEX_TIMEOUT_SECONDS` (default 10s); timeouts and failures never alter the HTTP response. Background workers can replace this later without interface changes.
 - **Internal API**: `/internal/v1/memories` (create/supersede), `/internal/v1/memories/{id}/supersede`, `/internal/v1/retrieval?q=&conversation_id=`, `/internal/v1/conversations/{id}/index`.
 
 Not yet implemented: memory *extraction* from conversations and compaction (M4), diversity/MMR + budget selection + prompt injection of retrieved context (M5).

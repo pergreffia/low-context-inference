@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -154,17 +155,33 @@ async def chat_completions(request: Request):
         await index_memory(conversation_id)
 
     async def index_memory(conversation_id: str) -> None:
-        """Chunk+index completed turns; best-effort, never breaks responses."""
+        """Chunk+index completed turns; best-effort, never breaks responses.
+
+        Latency trade-off (M3 review §4): indexing is synchronous but bounded
+        by MEMORY__INDEX_TIMEOUT_SECONDS so slow embedding/vector endpoints
+        cannot stall the request indefinitely.
+        """
         memory = getattr(app_state, "memory", None)
         if memory is None or not settings.memory.auto_index:
             return
         try:
-            created = await memory.index_completed_turns(conversation_id)
+            created = await asyncio.wait_for(
+                memory.index_completed_turns(conversation_id),
+                timeout=settings.memory.index_timeout_seconds,
+            )
             if created:
                 logger.info(
                     "turns_indexed",
                     extra={"conversation_id": conversation_id, "chunks": created},
                 )
+        except TimeoutError:
+            logger.warning(
+                "memory_index_timeout",
+                extra={
+                    "conversation_id": conversation_id,
+                    "timeout_seconds": settings.memory.index_timeout_seconds,
+                },
+            )
         except Exception as exc:  # noqa: BLE001 - degradation by design
             logger.warning(
                 "memory_index_failed",

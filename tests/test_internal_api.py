@@ -307,3 +307,119 @@ def test_chat_completion_auto_indexes_completed_turns():
             return [r["start_seq"] for r in rows]
 
         assert ctx.run_async(seqs()) == [0]
+
+
+class FakeOwnedClient:
+    """Minimal stand-in for an owned httpx.AsyncClient (lifecycle tests)."""
+
+    def __init__(self):
+        self.aclose_called = False
+        self.headers: dict[str, str] = {}
+
+    async def aclose(self):
+        self.aclose_called = True
+
+
+def test_lifespan_does_not_close_injected_clients():
+    from context_proxy.config import DatabaseSettings, Settings
+    from context_proxy.main import create_app
+
+    settings = Settings(_env_file=None, database=DatabaseSettings(url=MIGRATION_DSN))
+    embed_fake = FakeOwnedClient()
+    qdrant_fake = FakeOwnedClient()
+    app = create_app(
+        settings,
+        llm_client=httpx.AsyncClient(base_url="http://up.test/v1"),
+        embedding_client=embed_fake,
+        qdrant_client=qdrant_fake,
+    )
+    with TestClient(app):
+        pass  # lifespan runs and shuts down
+    assert embed_fake.aclose_called is False
+    assert qdrant_fake.aclose_called is False
+
+
+def test_lifespan_closes_owned_embedding_and_qdrant_clients():
+    from context_proxy.config import DatabaseSettings, Settings
+    from context_proxy.main import create_app
+
+    settings = Settings(_env_file=None, database=DatabaseSettings(url=MIGRATION_DSN))
+    app = create_app(settings)
+    with TestClient(app) as client:
+        memory = client.app.state.memory
+        assert memory is not None
+
+    # owned clients must be closed after shutdown
+    assert memory._embedder._client.is_closed
+    assert memory._qdrant._client.is_closed
+
+
+def test_memory_service_unavailable_returns_503():
+    ctx = AppContext()
+    with ctx.client as client:
+        client.app.state.memory = None
+        r = client.get(
+            "/internal/v1/retrieval",
+            params={"q": "anything", "conversation_id": str(uuid.uuid4())},
+        )
+        assert r.status_code == 503
+
+
+def test_internal_api_validation_errors():
+    ctx = AppContext()
+    with ctx.client as client:
+        ctx.install_memory()
+        conv = str(uuid.uuid4())
+
+        cases = [
+            (
+                "/internal/v1/memories",
+                {"kind": "nonsense", "content": "x", "conversation_id": conv},
+                422,
+            ),
+            (
+                "/internal/v1/memories",
+                {"kind": "fact", "content": "", "conversation_id": conv},
+                422,
+            ),
+            (
+                "/internal/v1/memories",
+                {"kind": "fact", "content": "x", "conversation_id": conv, "importance": 1.5},
+                422,
+            ),
+            (
+                "/internal/v1/memories",
+                {"kind": "fact", "content": "x", "conversation_id": "not-a-uuid"},
+                400,
+            ),
+            (
+                "/internal/v1/memories",
+                {
+                    "kind": "fact",
+                    "content": "x",
+                    "conversation_id": conv,
+                    "supersedes": "bad",
+                },
+                400,
+            ),
+        ]
+        for url, body, expected in cases:
+            r = client.post(url, json=body)
+            assert r.status_code == expected, (url, body, r.status_code)
+
+        r = client.post(f"/internal/v1/memories/{'z' * 8}/supersede", json={})
+        assert r.status_code == 400
+
+        r = client.get(
+            "/internal/v1/retrieval",
+            params={"q": "q", "conversation_id": conv, "limit": 0},
+        )
+        assert r.status_code == 422
+
+        r = client.get(
+            "/internal/v1/retrieval", params={"q": "", "conversation_id": conv}
+        )
+        assert r.status_code == 422
+
+        r = client.get("/internal/v1/retrieval", params={"q": "x", "conversation_id": "zz"})
+        assert r.status_code == 400

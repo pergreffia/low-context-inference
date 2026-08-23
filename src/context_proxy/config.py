@@ -58,6 +58,9 @@ class RetrievalSettings(BaseModel):
 class MemorySettings(BaseModel):
     auto_index: bool = True  # chunk+index completed turns after each response
     max_embed_chars: int = Field(default=8000, gt=0)
+    # Synchronous indexing latency budget (M3 review §4): the request waits at
+    # most this long for chunking+embedding+vector upsert before giving up.
+    index_timeout_seconds: float = Field(default=10.0, gt=0)
 
 
 class ContextSettings(BaseModel):

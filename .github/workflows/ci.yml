@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]" ruff
+      - run: ruff check .
+      - run: pytest -q
+
+  integration-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: context_proxy
+          POSTGRES_PASSWORD: context_proxy
+          POSTGRES_DB: context_proxy
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U context_proxy"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://context_proxy:context_proxy@localhost:55432/context_proxy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # Migrations are applied by the suite itself (apply_migrations); the job
+      # fails if ANY integration test fails, including the full M3 memory set.
+      - run: pytest -q

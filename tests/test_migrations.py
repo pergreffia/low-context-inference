@@ -43,6 +43,7 @@ def test_migrations_idempotent_and_schema_present():
         "0002_tool_result_integrity.sql",
         "0003_message_metadata.sql",
         "0004_memory_foundations.sql",
+        "0005_index_watermark.sql",
     } <= applied | set(first)
     assert second == []  # never reapplied within a single process
     expected = {
@@ -211,6 +212,7 @@ def test_concurrent_startup_applies_each_exactly_once():
                 "0002_tool_result_integrity.sql",
                 "0003_message_metadata.sql",
                 "0004_memory_foundations.sql",
+                "0005_index_watermark.sql",
             }
             # every migration applied exactly once across both runners
             assert len(names) == len(set(names))
@@ -231,5 +233,124 @@ def test_concurrent_startup_applies_each_exactly_once():
         finally:
             await pool_a.close()
             await pool_b.close()
+
+    asyncio.run(_run())
+
+
+def test_migrations_from_clean_database_create_full_m3_schema():
+    """M3 review §15: empty DB -> all tables/columns/indexes/constraints."""
+
+    async def _run():
+        from context_proxy.db.database import apply_migrations
+
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            for table in (
+                "summaries",
+                "memory_records",
+                "conversation_chunks",
+                "tool_results",
+                "tool_calls",
+                "messages",
+                "conversations",
+                "schema_migrations",
+            ):
+                await pool.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+
+            completed = await apply_migrations(pool)
+            assert len(completed) == 5
+
+            cols = await pool.fetch(
+                """
+                SELECT table_name, column_name FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND column_name IN (
+                      'start_seq', 'ts', 'last_indexed_seq',
+                      'supersedes', 'superseded_by'
+                  )
+                """
+            )
+            have = {(c["table_name"], c["column_name"]) for c in cols}
+            assert ("conversation_chunks", "start_seq") in have
+            assert ("conversation_chunks", "ts") in have
+            assert ("memory_records", "ts") in have
+            assert ("conversations", "last_indexed_seq") in have
+            assert ("memory_records", "supersedes") in have
+            assert ("memory_records", "superseded_by") in have
+
+            indexes = await pool.fetch(
+                """
+                SELECT indexname FROM pg_indexes
+                WHERE schemaname='public' AND indexname LIKE 'uq_%'
+                """
+            )
+            names = {r["indexname"] for r in indexes}
+            assert "uq_chunks_conversation_start_seq" in names
+
+            gin = await pool.fetch(
+                """
+                SELECT indexname FROM pg_indexes
+                WHERE schemaname='public' AND indexname LIKE 'idx_%ts'
+                """
+            )
+            gin_names = {r["indexname"] for r in gin}
+            assert {"idx_chunks_ts", "idx_memory_ts"} <= gin_names
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_migrations_second_application_is_noop_on_schema():
+    """M3 review §16: applying twice changes nothing and duplicates nothing."""
+    import asyncio
+
+    async def _run():
+        from context_proxy.db.database import apply_migrations
+
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            await apply_migrations(pool)
+
+            snapshot_tables = await pool.fetch(
+                """
+                SELECT table_name, column_name FROM information_schema.columns
+                WHERE table_schema = 'public' ORDER BY table_name, column_name
+                """
+            )
+            snapshot_indexes = await pool.fetch(
+                "SELECT indexname FROM pg_indexes WHERE schemaname='public' ORDER BY indexname"
+            )
+            snapshot_marks = await pool.fetch(
+                """
+                SELECT name, count(*) AS n FROM schema_migrations
+                GROUP BY name HAVING count(*) > 1
+                """
+            )
+
+            second = await apply_migrations(pool)
+            assert second == []
+
+            after_tables = await pool.fetch(
+                """
+                SELECT table_name, column_name FROM information_schema.columns
+                WHERE table_schema = 'public' ORDER BY table_name, column_name
+                """
+            )
+            after_indexes = await pool.fetch(
+                "SELECT indexname FROM pg_indexes WHERE schemaname='public' ORDER BY indexname"
+            )
+            assert [tuple(r.values()) for r in after_tables] == [
+                tuple(r.values()) for r in snapshot_tables
+            ]
+            assert [tuple(r.values()) for r in after_indexes] == [
+                tuple(r.values()) for r in snapshot_indexes
+            ]
+            fresh_dupes = await pool.fetch(
+                "SELECT count(*) AS n FROM schema_migrations GROUP BY name HAVING count(*) > 1"
+            )
+            assert fresh_dupes == [] or snapshot_marks == []
+        finally:
+            await pool.close()
 
     asyncio.run(_run())

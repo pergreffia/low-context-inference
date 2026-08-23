@@ -31,6 +31,7 @@ def create_app(
 ) -> FastAPI:
     settings = settings or load_settings()
     database = database or Database(settings.database)
+    owned_clients: list[httpx.AsyncClient] = []
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -47,13 +48,30 @@ def create_app(
         if memory_service is not None:
             app.state.memory = memory_service
         elif database.available and database.pool is not None:
+            # Ownership rule (M3 review §2): clients created here are closed on
+            # shutdown; injected/external clients are NEVER closed by the app.
+            embed_client = embedding_client
+            if embed_client is None:
+                embed_client = httpx.AsyncClient(
+                    base_url=settings.embeddings.base_url,
+                    timeout=httpx.Timeout(settings.embeddings.timeout_seconds),
+                )
+                owned_clients.append(embed_client)
+            qdrant_http = qdrant_client
+            if qdrant_http is None:
+                qdrant_http = httpx.AsyncClient(
+                    base_url=settings.qdrant.base_url,
+                    timeout=httpx.Timeout(settings.qdrant.timeout_seconds),
+                )
+                owned_clients.append(qdrant_http)
+
             embedder = OpenAICompatibleEmbeddingProvider(
-                settings.embeddings, client=embedding_client
+                settings.embeddings, client=embed_client
             )
             vectors = QdrantVectorStore(
                 settings.qdrant.base_url,
                 collection=settings.qdrant.collection,
-                client=qdrant_client,
+                client=qdrant_http,
             )
             app.state.memory = MemoryService(
                 database.pool,
@@ -65,6 +83,8 @@ def create_app(
         else:
             app.state.memory = None
         yield
+        for client in owned_clients:
+            await client.aclose()
         await database.close()
 
     app = FastAPI(title="Context Proxy", version="0.1.0", lifespan=lifespan)

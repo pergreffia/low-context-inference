@@ -334,3 +334,394 @@ def test_weights_change_ranking_order():
             await pool.close()
 
     asyncio.run(_run())
+
+
+class BrokenVectorStore(QdrantVectorStore):
+    """Simulates a Qdrant outage."""
+
+    def __init__(self):
+        super().__init__("offline://none")
+
+    async def search(self, vector, limit, conversation_id=None):
+        raise RuntimeError("qdrant down")
+
+    async def upsert(self, points, vector_size):
+        raise RuntimeError("qdrant down")
+
+
+def test_supersession_rejects_cross_conversation_target():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv_a = str(uuid.uuid4())
+            conv_b = str(uuid.uuid4())
+            memory = await _make(pool)
+
+            target_id = await memory.create_memory(
+                MemoryCreate(
+                    kind=MemoryKind.DECISION,
+                    content="decision owned by conversation A",
+                    conversation_id=conv_a,
+                )
+            )
+            with pytest.raises(ValueError) as excinfo:
+                await memory.create_memory(
+                    MemoryCreate(
+                        kind=MemoryKind.DECISION,
+                        content="attempt from conversation B",
+                        conversation_id=conv_b,
+                        supersedes=target_id,
+                    )
+                )
+            assert "different conversation" in str(excinfo.value)
+
+            row = await pool.fetchrow(
+                "SELECT status, superseded_by FROM memory_records WHERE id = $1::uuid",
+                uuid.UUID(target_id),
+            )
+            assert row["status"] == "active"
+            assert row["superseded_by"] is None
+            in_a = await pool.fetchval(
+                "SELECT count(*) FROM memory_records WHERE conversation_id = $1::uuid",
+                uuid.UUID(conv_a),
+            )
+            in_b = await pool.fetchval(
+                "SELECT count(*) FROM memory_records WHERE conversation_id = $1::uuid",
+                uuid.UUID(conv_b),
+            )
+            assert in_a == 1 and in_b == 0  # nothing new created anywhere
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_degraded_qdrant_leg_still_returns_lexical_results():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            memory = MemoryService(
+                pool,
+                HashingEmbedder(),
+                BrokenVectorStore(),
+                retrieval_settings=RetrievalSettings(),
+            )
+            await memory.create_memory(
+                MemoryCreate(
+                    kind=MemoryKind.FACT,
+                    content="the release pipeline signs artifacts with cosign",
+                    conversation_id=conv,
+                )
+            )
+            items = await memory.retrieve("release pipeline cosign", conv)
+            assert len(items) == 1
+            assert items[0].components["lexical"] > 0
+            assert items[0].components["semantic"] == 0.0
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_superseded_memory_returned_by_qdrant_is_filtered():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            memory = MemoryService(
+                pool,
+                HashingEmbedder(),
+                RecordingVectorStore(),
+                retrieval_settings=RetrievalSettings(),
+            )
+            old_id = await memory.create_memory(
+                MemoryCreate(
+                    kind=MemoryKind.DECISION,
+                    content="cache eviction policy is LRU",
+                    conversation_id=conv,
+                )
+            )
+            new_id = await memory.create_memory(
+                MemoryCreate(
+                    kind=MemoryKind.DECISION,
+                    content="cache eviction policy is LFU",
+                    conversation_id=conv,
+                    supersedes=old_id,
+                )
+            )
+            stale_hit = {
+                "id": old_id,
+                "score": 0.99,
+                "payload": {"conversation_id": conv, "memory_id": old_id},
+            }
+            fresh_hit = {
+                "id": new_id,
+                "score": 0.4,
+                "payload": {"conversation_id": conv, "memory_id": new_id},
+            }
+
+            class StaleVectorStore(RecordingVectorStore):
+                async def search(self, vector, limit, conversation_id=None):
+                    return [stale_hit, fresh_hit]
+
+            stale_memory = MemoryService(
+                pool,
+                HashingEmbedder(),
+                StaleVectorStore(),
+                retrieval_settings=RetrievalSettings(),
+            )
+            items = await stale_memory.retrieve("cache eviction policy", conv)
+            ids = {i.id for i in items}
+            assert new_id in ids
+            assert old_id not in ids  # PostgreSQL authoritative: stale hit filtered
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_concurrent_indexing_creates_no_duplicate_chunks():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN, min_size=2, max_size=8)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            memory = await _make(pool)
+            await store.append_messages(
+                conv,
+                [
+                    {"role": "user", "content": "first turn question"},
+                    {"role": "assistant", "content": "first turn answer"},
+                ],
+            )
+            await store.append_messages(conv, [{"role": "user", "content": "second"}])
+
+            results = await asyncio.gather(
+                memory.index_completed_turns(conv),
+                memory.index_completed_turns(conv),
+                return_exceptions=True,
+            )
+            assert all(not isinstance(r, BaseException) for r in results), results
+
+            dupes = await pool.fetch(
+                """
+                SELECT start_seq FROM conversation_chunks
+                WHERE conversation_id = $1::uuid
+                GROUP BY start_seq HAVING count(*) > 1
+                """,
+                conv,
+            )
+            assert dupes == []
+            total = await pool.fetchval(
+                "SELECT count(*) FROM conversation_chunks WHERE conversation_id = $1::uuid",
+                conv,
+            )
+            assert total == 1
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+async def _seed_two_turns(store, conv):
+    await store.append_messages(
+        conv,
+        [
+            {"role": "user", "content": "turn one question"},
+            {"role": "assistant", "content": "turn one answer"},
+        ],
+    )
+    await store.append_messages(conv, [{"role": "user", "content": "turn two start"}])
+
+
+def test_incremental_indexing_only_processes_new_turns():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            memory = await _make(pool)
+            await _seed_two_turns(store, conv)
+
+            assert await memory.index_completed_turns(conv) == 1
+
+            # complete turn 2; only IT must be processed now
+            await store.append_messages(
+                conv, [{"role": "assistant", "content": "turn two answer"}]
+            )
+            await store.append_messages(conv, [{"role": "user", "content": "turn three"}])
+            created = await memory.index_completed_turns(conv)
+            assert created == 1
+
+            rows = await pool.fetch(
+                """
+                SELECT start_seq FROM conversation_chunks
+                WHERE conversation_id = $1::uuid ORDER BY start_seq
+                """,
+                conv,
+            )
+            assert [r["start_seq"] for r in rows] == [0, 2]
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_incremental_indexing_remains_idempotent():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            memory = await _make(pool)
+            await _seed_two_turns(store, conv)
+
+            results = [
+                await memory.index_completed_turns(conv) for _ in range(3)
+            ]
+            assert results == [1, 0, 0]
+
+            rows = await pool.fetch(
+                """
+                SELECT start_seq FROM conversation_chunks
+                WHERE conversation_id = $1::uuid ORDER BY start_seq
+                """,
+                conv,
+            )
+            assert [r["start_seq"] for r in rows] == [0]
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_semantic_only_hit_resolved_from_postgresql():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            other = str(uuid.uuid4())
+            memory = MemoryService(
+                pool,
+                HashingEmbedder(),
+                RecordingVectorStore(),
+                retrieval_settings=RetrievalSettings(),
+            )
+            mem_id = await memory.create_memory(
+                MemoryCreate(
+                    kind=MemoryKind.FACT,
+                    content="zebra quadrant threshold",
+                    conversation_id=conv,
+                )
+            )
+
+            class SemanticOnlyStore(RecordingVectorStore):
+                async def search(self, vector, limit, conversation_id=None):
+                    if conversation_id != conv:
+                        return []  # isolation enforced at the vector leg too
+                    return [
+                        {
+                            "id": mem_id,
+                            "score": 0.95,
+                            "payload": {
+                                "conversation_id": conv,
+                                "memory_id": mem_id,
+                            },
+                        }
+                    ]
+
+            semantic_memory = MemoryService(
+                pool,
+                HashingEmbedder(),
+                SemanticOnlyStore(),
+                retrieval_settings=RetrievalSettings(),
+            )
+            items = await semantic_memory.retrieve("unrelated keywords here", conv)
+            assert len(items) == 1
+            assert items[0].id == mem_id
+            assert items[0].components["semantic"] > 0
+            assert items[0].components["lexical"] == 0.0
+
+            assert await semantic_memory.retrieve("anything", other) == []
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_empty_and_weak_retrieval_returns_nothing():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            memory = await _make(pool)
+
+            # no data at all
+            assert await memory.retrieve("anything whatsoever", conv) == []
+
+            # data exists but zero lexical + zero semantic overlap -> excluded
+            await memory.create_memory(
+                MemoryCreate(
+                    kind=MemoryKind.FACT,
+                    content="completely orthogonal stored fact",
+                    conversation_id=conv,
+                )
+            )
+            class NoHits(RecordingVectorStore):
+                async def search(self, vector, limit, conversation_id=None):
+                    return []
+
+            no_hits = MemoryService(
+                pool,
+                HashingEmbedder(),
+                NoHits(),
+                retrieval_settings=RetrievalSettings(),
+            )
+            assert await no_hits.retrieve("zzz qqq xxx", conv) == []
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_equal_scores_order_deterministically_by_id():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            memory = MemoryService(
+                pool,
+                HashingEmbedder(),
+                RecordingVectorStore(),
+                retrieval_settings=RetrievalSettings(
+                    importance_weight=0.0,
+                    recency_weight=0.0,
+                    type_weight=0.0,
+                ),
+            )
+            id_a = await memory.create_memory(
+                MemoryCreate(
+                    kind=MemoryKind.FACT,
+                    content="identical twin fact",
+                    conversation_id=conv,
+                )
+            )
+            id_b = await memory.create_memory(
+                MemoryCreate(
+                    kind=MemoryKind.FACT,
+                    content="identical twin fact",
+                    conversation_id=conv,
+                )
+            )
+            items = await memory.retrieve("identical twin fact", conv)
+            scores = [i.score for i in items]
+            assert scores == sorted(scores, reverse=True)
+            top_lex = items[0].components["lexical"]
+            tied = [i.id for i in items if i.components["lexical"] == top_lex]
+            assert tied == sorted(tied)  # ID tie-breaker ascending
+            assert {id_a, id_b} <= set(tied)
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
