@@ -214,6 +214,17 @@ class Registry:
         self._collectors.append(collector)
         return collector
 
+    def reset(self) -> None:
+        """Drop every time series (test isolation; never call at runtime)."""
+        for collector in self._collectors:
+            with collector._lock:
+                if isinstance(collector, Histogram):
+                    collector._bucket_counts.clear()
+                    collector._sums.clear()
+                    collector._counts.clear()
+                else:
+                    collector._values.clear()
+
     def render(self) -> str:
         lines: list[str] = []
         for collector in self._collectors:

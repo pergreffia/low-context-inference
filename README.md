@@ -16,8 +16,9 @@ M4 context assembly plus operational hardening (`observability/`, `providers/res
 - **Resource limits**: oversized bodies rejected pre-parse with 413 `request_too_large` (`SERVER__MAX_BODY_BYTES`).
 - **Configuration validation**: e.g. safety margin must be smaller than model limit.
 - **Health/readiness**: `/healthz` liveness (existing), `/readyz` readiness with dependency checks; graceful shutdown closes owned resources in isolation.
-- **Operational endpoints**: `/internal/v1/diagnostics` (component snapshot, no secrets), `/internal/v1/index/rebuild?force=` — rebuilds the derived Qdrant index from authoritative PostgreSQL.
+- **Operational endpoints**: `/internal/v1/diagnostics` (component snapshot, no secrets), `/internal/v1/index/rebuild?conversation_id=&force=` — rebuilds the derived Qdrant index from authoritative PostgreSQL, optionally scoped to one conversation; per-item failures are reported as `chunks_failed`/`memories_failed` while expected `VectorStoreError`s never abort the run (unexpected programming errors propagate).
 - **Production image**: non-root user, HEALTHCHECK, worker scaling via `SERVER__WEB_CONCURRENCY`; CI builds the image.
+- **Security posture**: `/internal/v1/*` is administrative and MUST only be exposed on the internal network (no auth framework in M5 by design). Metrics/breaker/rate limiter are process-local: with `WEB_CONCURRENCY > 1` counters and buckets are per-worker. Rate-limit identity policy: `X-Conversation-ID` header → own bucket, else client host; rotating the header yields fresh buckets by design (per-identity fairness, not global quota).
 
 Not yet implemented: distributed rate limiting/metrics backends, OTel tracing export, load-testing harness automation (a concurrency smoke test ships instead).
 

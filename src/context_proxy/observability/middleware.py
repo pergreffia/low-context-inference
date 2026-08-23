@@ -1,17 +1,22 @@
-"""HTTP observability middleware (M5, master prompt §12).
+"""HTTP observability + resource limits as a pure ASGI middleware (M5).
 
-One ASGI middleware provides:
+Provides:
 
 - request-id correlation (inbound X-Request-ID honored, else generated) —
-  echoed back on the response and bound to every log record;
-- end-to-end latency histogram + request counters with a low-cardinality
-  route label (path templates only, never raw paths/ids);
-- resource limits: oversized bodies rejected before route handling;
-- structured completion log including stage breakdown when routes record
-  named stages on request.state.
+  bound to every log record via context var and echoed on the response
+  unless the upstream already supplied one (M1.1 forwarding policy);
+- end-to-end latency histogram + request counters with low-cardinality route
+  templates (never raw paths/ids);
+- resource limits enforced during body READ, not just Content-Length: a
+  chunked body exceeding SERVER__MAX_BODY_BYTES is cut off mid-stream and
+  answered 413 before the application ever runs;
+- rate limiting keyed by identity policy (X-Conversation-ID header, else
+  client host — see RateLimitSettings documentation);
+- structured completion log including named stage breakdown recorded by
+  routes on scope["state"].
 
-Streaming bodies are NEVER buffered or inspected: the middleware observes
-only transport-level events, keeping SSE passthrough opaque (§8).
+Streaming bodies are never buffered or inspected beyond size accounting:
+SSE passthrough stays opaque (master prompt §8).
 """
 
 from __future__ import annotations
@@ -21,8 +26,6 @@ import time
 import uuid
 from contextvars import ContextVar
 
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from context_proxy.observability.metrics import (
@@ -62,7 +65,33 @@ def normalize_route(path: str) -> str:
     return "other"
 
 
-class ObservabilityMiddleware(BaseHTTPMiddleware):
+def _error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    *,
+    err_type: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    response: Response = JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": err_type
+                or ("invalid_request_error" if status_code < 500 else "api_error"),
+                "param": None,
+                "code": code,
+            }
+        },
+        headers=headers,
+    )
+    return response
+
+
+class ObservabilityMiddleware:
+    """Pure ASGI middleware; no BaseHTTPMiddleware buffering involved."""
+
     def __init__(
         self,
         app,
@@ -71,82 +100,95 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
         rate_limiter: RateLimiter | None = None,
         rate_limit_enabled: bool = False,
     ):
-        super().__init__(app)
+        self.app = app
         self._max_body_bytes = max_body_bytes
         self._limiter = rate_limiter
         self._rate_limit_enabled = rate_limit_enabled and rate_limiter is not None
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
-        start = time.monotonic()
-        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started = time.monotonic()
+        request_id = _header(scope, "x-request-id") or uuid.uuid4().hex[:16]
         token = REQUEST_ID_CTX.set(request_id)
+        state = scope.setdefault("state", {})
+        state.setdefault("stages", {})
+        route = normalize_route(scope.get("path", ""))
+        responded = False
 
-        route = normalize_route(request.url.path)
+        async def send_wrapper(message) -> None:
+            nonlocal responded
+            if message["type"] == "http.response.start":
+                responded = True
+                state["response_status"] = message["status"]
+                headers = list(message.get("headers") or [])
+                names = {name.decode("latin-1").lower() for name, _ in headers}
+                if "x-request-id" not in names:
+                    # Upstream-provided X-Request-ID wins (M1.1 policy).
+                    headers.append((b"x-request-id", request_id.encode("latin-1")))
+                message = {**message, "headers": headers}
+            await send(message)
 
-        # Resource limit: reject before reading/parsing anything heavy.
-        content_length = request.headers.get("content-length")
-        if (
-            content_length
-            and content_length.isdigit()
-            and int(content_length) > self._max_body_bytes
-        ):
-            HTTP_REQUESTS_TOTAL.labels(
-                method=request.method, route=route, status="413"
-            ).inc()
-            response: Response = JSONResponse(
-                status_code=413,
-                content={
-                    "error": {
-                        "message": f"request body exceeds {self._max_body_bytes} bytes",
-                        "type": "invalid_request_error",
-                        "param": None,
-                        "code": "request_too_large",
-                    }
-                },
+        async def reject(
+            status: int, code: str, message: str, err_type: str | None = None,
+            **extra_headers,
+        ) -> None:
+            response = _error_response(
+                status, code, message, err_type=err_type, headers=extra_headers or None
             )
-            response.headers["X-Request-ID"] = request_id
-            REQUEST_ID_CTX.reset(token)
-            return response
-
-        # Rate limiting keyed by conversation identity when present.
-        if self._rate_limit_enabled:
-            key = request.headers.get("x-conversation-id") or (
-                request.client.host if request.client else "unknown"
-            )
-            if not self._limiter.allow(key):
-                RATE_LIMIT_REJECTS_TOTAL.inc()
-                retry_after = str(self._limiter.retry_after(key))
-                HTTP_REQUESTS_TOTAL.labels(
-                    method=request.method, route=route, status="429"
-                ).inc()
-                response = JSONResponse(
-                    status_code=429,
-                    content={
-                        "error": {
-                            "message": "rate limit exceeded",
-                            "type": "rate_limit_error",
-                            "param": None,
-                            "code": "rate_limit_exceeded",
-                        }
-                    },
-                    headers={"Retry-After": retry_after},
-                )
-                response.headers["X-Request-ID"] = request_id
-                REQUEST_ID_CTX.reset(token)
-                logger.warning(
-                    "rate_limited",
-                    extra={"route": route, "retry_after": retry_after},
-                )
-                return response
+            await response(scope, receive, send_wrapper)
 
         try:
-            response = await call_next(request)
+            # --- pre-flight checks ------------------------------------------
+            content_length = _header(scope, "content-length")
+            if (
+                content_length is not None
+                and content_length.isdigit()
+                and int(content_length) > self._max_body_bytes
+            ):
+                HTTP_REQUESTS_TOTAL.labels(method=scope["method"], route=route, status="413").inc()
+                logger.warning("request_too_large", extra={"route": route})
+                await reject(413, "request_too_large",
+                             f"request body exceeds {self._max_body_bytes} bytes")
+                return
+
+            if self._rate_limit_enabled:
+                key = _header(scope, "x-conversation-id") or _client_host(scope)
+                if not self._limiter.allow(key):
+                    RATE_LIMIT_REJECTS_TOTAL.inc()
+                    retry_after = str(self._limiter.retry_after(key))
+                    HTTP_REQUESTS_TOTAL.labels(
+                        method=scope["method"], route=route, status="429"
+                    ).inc()
+                    logger.warning(
+                        "rate_limited", extra={"route": route, "retry_after": retry_after}
+                    )
+                    await reject(429, "rate_limit_exceeded", "rate limit exceeded",
+                                 err_type="rate_limit_error",
+                                 **{"Retry-After": retry_after})
+                    return
+
+            # --- application -------------------------------------------------
+            if content_length is None:
+                # No Content-Length (chunked): pre-buffer up to the cap so
+                # enforcement happens BEFORE the app reads anything.
+                messages, exceeded = await _drain_body(receive, self._max_body_bytes)
+                if exceeded:
+                    HTTP_REQUESTS_TOTAL.labels(
+                        method=scope["method"], route=route, status="413"
+                    ).inc()
+                    logger.warning("request_too_large", extra={"route": route})
+                    await reject(413, "request_too_large",
+                                 f"request body exceeds {self._max_body_bytes} bytes")
+                    return
+                receive = _replaying_receive(messages, receive)
+            await self.app(scope, receive, send_wrapper)
         except Exception:
-            duration = time.monotonic() - start
+            duration = time.monotonic() - started
             HTTP_REQUESTS_TOTAL.labels(
-                method=request.method, route=route, status="500"
+                method=scope["method"], route=route, status="500"
             ).inc()
             HTTP_REQUEST_DURATION.labels(route=route).observe(duration)
             logger.exception(
@@ -155,35 +197,86 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             )
             raise
         finally:
-            pass
+            REQUEST_ID_CTX.reset(token)
 
-        duration = time.monotonic() - start
-        status = str(response.status_code)
-        HTTP_REQUESTS_TOTAL.labels(method=request.method, route=route, status=status).inc()
+        duration = time.monotonic() - started
+        status_code = state.get("response_status", 200)
+        status = str(status_code)
+        HTTP_REQUESTS_TOTAL.labels(method=scope["method"], route=route, status=status).inc()
         HTTP_REQUEST_DURATION.labels(route=route).observe(duration)
-        # Honor the M1.1 forwarding policy: an upstream-provided X-Request-ID
-        # survives untouched; otherwise our correlation id is echoed back.
-        if "x-request-id" not in {k.lower() for k in response.headers}:
-            response.headers["X-Request-ID"] = request_id
-
-        stages = getattr(request.state, "stages", None) or {}
+        stages = state.get("stages") or {}
         logger.info(
             "request_completed",
             extra={
                 "route": route,
-                "status": response.status_code,
+                "status": status_code,
                 "duration_seconds": round(duration, 6),
                 **{f"stage_{k}_seconds": round(v, 6) for k, v in sorted(stages.items())},
             },
         )
-        REQUEST_ID_CTX.reset(token)
-        return response
 
 
-def record_stage(request: Request, name: str, started_monotonic: float) -> None:
-    """Record one named pipeline stage; used for the latency breakdown."""
-    stages = getattr(request.state, "stages", None)
+def record_stage(request, name: str, started_monotonic: float) -> None:
+    """Record one named pipeline stage for the latency breakdown."""
+    stages = getattr(getattr(request, "state", None), "stages", None)
     if stages is None:
         stages = {}
         request.state.stages = stages
     stages[name] = time.monotonic() - started_monotonic
+
+
+async def _drain_body(receive, max_body_bytes: int) -> tuple[list[dict], bool]:
+    """Consume request messages, buffering up to max_body_bytes.
+
+    Returns (buffered_messages, exceeded). When exceeded the remaining body is
+    drained (discarded) so the client can finish sending, and the caller must
+    answer 413 instead of invoking the application.
+    """
+    buffered: list[dict] = []
+    total = 0
+    exceeded = False
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return buffered, True
+        if message["type"] != "http.request":
+            if exceeded:
+                continue  # keep draining protocol noise until terminal message
+            buffered.append(message)
+            if not message.get("more_body"):
+                return buffered, False
+            continue
+        body = message.get("body") or b""
+        total += len(body)
+        if not exceeded and total > max_body_bytes:
+            exceeded = True
+            buffered = []  # discard; never forwarded downstream
+        elif not exceeded:
+            buffered.append(message)
+        if not message.get("more_body"):
+            return buffered, exceeded
+
+
+def _replaying_receive(messages: list[dict], original_receive):
+    """Replay pre-buffered request messages, then defer to the source."""
+    queue = list(messages)
+
+    async def wrapped_receive():
+        if queue:
+            return queue.pop(0)
+        return await original_receive()
+
+    return wrapped_receive
+
+
+def _header(scope, name: str) -> str | None:
+    target = name.encode("latin-1")
+    for key, value in scope.get("headers") or []:
+        if key == target:
+            return value.decode("latin-1")
+    return None
+
+
+def _client_host(scope) -> str:
+    client = scope.get("client") or ("unknown", 0)
+    return str(client[0])

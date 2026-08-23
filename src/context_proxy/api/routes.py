@@ -174,8 +174,9 @@ async def chat_completions(request: Request):
         Indexing completed turns runs after persistence and can never affect
         the response either.
 
-        M5: token accounting happens here FIRST — it must work even when the
-        store is degraded (persistence is optional, accounting is not).
+        M5 review §2: token accounting happens here EXACTLY ONCE per upstream
+        response, before any store interaction — accounting works with or
+        without persistence and is never doubled.
         """
         record_tokens(metadata.get("usage") if metadata else None)
         if store is None or message is None:
@@ -270,16 +271,16 @@ async def chat_completions(request: Request):
                 )
                 if value is not None
             }
-            # M5: token accounting is independent of persistence availability.
-            record_tokens(metadata.get("usage"))
         except Exception as exc:  # noqa: BLE001 - opaque passthrough first
             logger.warning(
                 "assistant_persistence_failed",
                 extra={"conversation_id": conversation_id, "error": str(exc)},
             )
         else:
-            if store is not None:
-                await persist_assistant(message, metadata or None)
+            # persist_assistant performs token accounting EXACTLY ONCE before
+            # any store interaction (M5 review §2): accounting works with or
+            # without persistence and is never doubled.
+            await persist_assistant(message, metadata or None)
 
     response = upstream_response(status_code, headers, body)
     for name, value in extra_headers.items():

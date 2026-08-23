@@ -3,6 +3,11 @@
 Typed request/response schemas; local infrastructure surface — not part of
 the public OpenAI-compatible contract. All identifiers are validated as UUIDs
 so malformed input yields controlled 400s instead of raw database errors.
+
+INTERNAL-ONLY (M5 review §5): this router is administrative. `/index/rebuild`
+in particular can consume significant embedding/Qdrant resources. It MUST be
+exposed exclusively on the internal network (do not publish through public
+ingress); no authentication framework is included in M5 by design.
 """
 
 from __future__ import annotations

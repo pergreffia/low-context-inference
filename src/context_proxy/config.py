@@ -102,9 +102,20 @@ class ResilienceSettings(BaseModel):
 class RateLimitSettings(BaseModel):
     """In-process token-bucket rate limiting (M5).
 
-    Single-instance scope by design (master prompt §2.6: no unnecessary
-    infrastructure — no Redis). Keyed per conversation id when available,
-    else per client host.
+    Identity policy (M5 review §7):
+
+        X-Conversation-ID header present -> that value's own bucket
+            (raw header value, checked BEFORE identity validation);
+        otherwise                        -> client host bucket
+
+    Body-level conversation ids are deliberately ignored: the decision is
+    made pre-parse. Consequence, by design: a client rotating
+    X-Conversation-ID gets fresh buckets — the limiter guarantees per-identity
+    fairness, not abuse-proof global quota.
+
+    Single-instance scope (§2.6): with SERVER__WEB_CONCURRENCY > 1 each
+    worker process keeps its own buckets — limits are effectively multiplied
+    by the worker count.
     """
 
     enabled: bool = False

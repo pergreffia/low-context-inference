@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 import time
 from collections.abc import Awaitable, Callable
 
@@ -29,6 +30,14 @@ HALF_OPEN = "half_open"
 
 
 class CircuitBreaker:
+    """Thread-safe breaker with an atomic HALF_OPEN probe reservation.
+
+    Contract: OPEN fails fast; after reset_seconds it transitions to
+    HALF_OPEN where EXACTLY ONE concurrent caller may probe upstream — every
+    other caller fails fast until the probe resolves. Probe success closes
+    the circuit; probe failure reopens it.
+    """
+
     def __init__(
         self,
         *,
@@ -41,44 +50,69 @@ class CircuitBreaker:
         self._threshold = failure_threshold
         self._reset_seconds = reset_seconds
         self._clock = clock
+        self._lock = threading.Lock()
         self._state = CLOSED
         self._consecutive_failures = 0
         self._opened_at = 0.0
+        self._probe_reserved = False
 
     @property
     def state(self) -> str:
+        with self._lock:
+            return self._current_state()
+
+    def _current_state(self) -> str:
+        # Caller must hold the lock.
         if self._state == OPEN and (self._clock() - self._opened_at) >= self._reset_seconds:
             self._transition(HALF_OPEN)
         return self._state
 
     def _transition(self, state: str) -> None:
+        # Caller must hold the lock.
         self._state = state
         if state == OPEN:
             self._opened_at = self._clock()
-        logger.info(
-            "circuit_state_changed",
-            extra={"state": state},
-        )
+            self._probe_reserved = False
+        elif state == CLOSED:
+            self._probe_reserved = False
+        logger.info("circuit_state_changed", extra={"state": state})
         set_circuit_state(state)
 
     def allow_attempt(self) -> bool:
-        """False when open (fail fast). Half-open allows exactly one probe."""
-        state = self.state
-        if state == OPEN:
-            return False
-        return True
+        """Atomically reserve the right to attempt a call.
+
+        False when OPEN, or when HALF_OPEN and the single probe is already
+        reserved by another in-flight request.
+        """
+        with self._lock:
+            state = self._current_state()
+            if state == OPEN:
+                return False
+            if state == HALF_OPEN:
+                if self._probe_reserved:
+                    return False
+                self._probe_reserved = True
+                return True
+            return True
 
     def record_success(self) -> None:
-        if self._state != CLOSED:
-            self._transition(CLOSED)
-        self._consecutive_failures = 0
+        with self._lock:
+            if self._state != CLOSED:
+                self._transition(CLOSED)
+            self._consecutive_failures = 0
+            self._probe_reserved = False
 
     def record_failure(self) -> None:
-        self._consecutive_failures += 1
-        if self._state == HALF_OPEN:
-            self._transition(OPEN)
-        elif self._consecutive_failures >= self._threshold:
-            self._transition(OPEN)
+        with self._lock:
+            self._probe_reserved = False
+            self._consecutive_failures += 1
+            if self._state == HALF_OPEN:
+                self._transition(OPEN)
+            elif (
+                self._state == CLOSED
+                and self._consecutive_failures >= self._threshold
+            ):
+                self._transition(OPEN)
 
 
 async def with_retries[T](

@@ -2,35 +2,48 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from context_proxy.config import (
+    EndpointSettings,
     RateLimitSettings,
     ResilienceSettings,
     ServerSettings,
 )
 from context_proxy.main import create_app
+from context_proxy.observability.metrics import REGISTRY
 from tests.conftest import UPSTREAM, make_settings, upstream_handler
+
+
+@pytest.fixture(autouse=True)
+def _isolated_metrics_registry():
+    """Zero the global registry around each test (review §2)."""
+    REGISTRY.reset()
+    yield
+    REGISTRY.reset()
 
 
 def build_client(
     captured: list[httpx.Request],
     *,
     settings_overrides: dict | None = None,
+    llm_client: httpx.AsyncClient | None = None,
 ) -> TestClient:
     settings = make_settings()
     if settings_overrides:
         settings = settings.model_copy(update=settings_overrides)
     app = create_app(
         settings,
-        llm_client=httpx.AsyncClient(
-            base_url=UPSTREAM, transport=upstream_handler(captured)
-        ),
+        llm_client=llm_client
+        or httpx.AsyncClient(base_url=UPSTREAM, transport=upstream_handler(captured)),
         store=None,
     )
     return TestClient(app)
@@ -40,6 +53,10 @@ def build_client(
 def run_client(client: TestClient) -> Iterator[TestClient]:
     with client as running:
         yield running
+
+
+def post_chat(client: TestClient, body: dict | None = None):
+    return client.post("/v1/chat/completions", json=body or CHAT_BODY)
 
 
 CHAT_BODY = {
@@ -162,7 +179,7 @@ class TestDiagnosticsAndRebuild:
         class RebuildableMemory:
             async def rebuild_vector_index(self, conversation_id=None, *, force=False):
                 calls.append((conversation_id, force))
-                return {"chunks": 3, "memories": 5}
+                return {"chunks": 3, "chunks_failed": 0, "memories": 5, "memories_failed": 0}
 
         app = create_app(
             make_settings(),
@@ -174,9 +191,26 @@ class TestDiagnosticsAndRebuild:
         )
         with TestClient(app) as client:
             response = client.post("/internal/v1/index/rebuild?force=true")
+            scoped = client.post(
+                "/internal/v1/index/rebuild"
+                "?conversation_id=aaaaaaaa-1111-4111-8111-111111111111"
+            )
         assert response.status_code == 200
-        assert response.json() == {"status": "ok", "chunks": 3, "memories": 5}
-        assert calls == [(None, True)]
+        assert response.json() == {
+            "status": "ok",
+            "chunks": 3,
+            "chunks_failed": 0,
+            "memories": 5,
+            "memories_failed": 0,
+        }
+        import uuid as _uuid
+
+        assert calls[0] == (None, True)
+        # scoped passthrough arrives as the parsed UUID
+        assert str(calls[1][0]) == "aaaaaaaa-1111-4111-8111-111111111111"
+        assert isinstance(calls[1][0], _uuid.UUID)
+        assert calls[1][1] is False
+        assert scoped.status_code == 200
 
     def test_rebuild_unavailable_without_memory_service(self, captured_requests):
         with run_client(build_client(captured_requests)) as client:
@@ -266,7 +300,6 @@ def test_stress_concurrent_chat_completions_stay_consistent():
     )
 
     client = TestClient(app)
-    import threading
 
     results: list[int] = []
     lock = threading.Lock()
@@ -284,3 +317,305 @@ def test_stress_concurrent_chat_completions_stay_consistent():
 
     assert sorted(results) == [200] * 30
     assert len(captured) == 30
+
+
+class TestTokenAccountingExactlyOnce:
+    """One upstream response -> exactly one token accounting (review §2)."""
+
+    USAGE = {"prompt_tokens": 5, "completion_tokens": 2}
+
+    @staticmethod
+    def _handler(with_usage: bool):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path != "/v1/chat/completions":
+                return httpx.Response(404, json={"error": {"message": "nf"}})
+            payload = json.loads(request.content)
+            if payload.get("stream") is True:
+                async def sse():
+                    yield b'data: {"id":"1","choices":[{"delta":{"content":"he"}}]}\n\n'
+                    if with_usage:
+                        yield (
+                            b'data: {"id":"1","choices":[],'
+                            b'"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\n'
+                        )
+                    yield b"data: [DONE]\n\n"
+
+                return httpx.Response(
+                    200,
+                    content=sse(),
+                    headers={"content-type": "text/event-stream"},
+                )
+            response = {
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+            if with_usage:
+                response["usage"] = dict(TestTokenAccountingExactlyOnce.USAGE)
+            return httpx.Response(200, json=response)
+
+        return handler
+
+    @staticmethod
+    def _token_counters(client: TestClient) -> dict[str, int]:
+        values: dict[str, int] = {}
+        for line in client.get("/metrics").text.splitlines():
+            if line.startswith("context_proxy_llm_tokens_total{"):
+                direction = line.split('direction="')[1].split('"')[0]
+                values[direction] = int(line.rsplit(" ", 1)[1])
+        return values
+
+    def test_non_streaming_counts_once(self, captured_requests):
+        with run_client(build_client(captured_requests)) as client:
+            assert post_chat(client).status_code == 200
+            counters = self._token_counters(client)
+        assert counters == {"prompt": 5, "completion": 2}
+
+    def test_non_streaming_with_store_counts_once(self, captured_requests):
+        class OkStore:
+            async def ensure_conversation(self, conversation_id):
+                return None
+
+            async def reconcile_history(self, conversation_id, messages, metadata=None):
+                return []
+
+        app = create_app(
+            make_settings(),
+            llm_client=httpx.AsyncClient(
+                base_url=UPSTREAM,
+                transport=httpx.MockTransport(self._handler(with_usage=True)),
+            ),
+            store=OkStore(),
+        )
+        with TestClient(app) as client:
+            assert post_chat(client).status_code == 200
+            counters = self._token_counters(client)
+        assert counters == {"prompt": 5, "completion": 2}  # NOT 10/4
+
+    def test_streaming_counts_once(self, captured_requests):
+        llm_client = httpx.AsyncClient(
+            base_url=UPSTREAM,
+            transport=httpx.MockTransport(self._handler(with_usage=True)),
+        )
+        with run_client(
+            build_client(captured_requests, llm_client=llm_client)
+        ) as client:
+            response = client.post(
+                "/v1/chat/completions", json={**CHAT_BODY, "stream": True}
+            )
+        assert response.status_code == 200
+        assert response.text.endswith("data: [DONE]\n\n")
+        assert self._token_counters(client) == {"prompt": 5, "completion": 2}
+
+    def test_streaming_without_usage_records_nothing(self, captured_requests):
+        llm_client = httpx.AsyncClient(
+            base_url=UPSTREAM,
+            transport=httpx.MockTransport(self._handler(with_usage=False)),
+        )
+        with run_client(
+            build_client(captured_requests, llm_client=llm_client)
+        ) as client:
+            response = client.post(
+                "/v1/chat/completions", json={**CHAT_BODY, "stream": True}
+            )
+        assert response.status_code == 200
+        assert self._token_counters(client) == {}
+
+
+class TestBodyLimitWithoutContentLength:
+    def test_chunked_body_over_limit_rejected_before_app(self, captured_requests):
+        overrides = {"server": ServerSettings(max_body_bytes=128)}
+        big_chunks = [b"x" * 64, b"y" * 64, b"z" * 64]  # 192 > 128
+
+        def stream_body():
+            yield from big_chunks
+
+        with run_client(
+            build_client(captured_requests, settings_overrides=overrides)
+        ) as client:
+            response = client.post("/v1/chat/completions", content=stream_body())
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == "request_too_large"
+        assert captured_requests == []  # upstream never reached
+
+    def test_asgi_level_limit_without_content_length_header(self):
+        """Pure-ASGI proof: no Content-Length header, oversized streamed body.
+
+        Contract: the middleware drains the body itself, never runs the
+        application when the cap is exceeded, and answers 413.
+        """
+        from context_proxy.observability.middleware import ObservabilityMiddleware
+
+        reached_app = {"flag": False}
+        received_messages: list[dict] = []
+
+        async def app(scope, receive, send):  # pragma: no cover - must NOT run
+            reached_app["flag"] = True
+            while True:
+                message = await receive()
+                received_messages.append(message)
+                if not message.get("more_body"):
+                    break
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        sent_messages: list[dict] = []
+
+        async def send(message):
+            sent_messages.append(message)
+
+        body_parts = [b"a" * 100, b"b" * 100]
+
+        async def receive():
+            if body_parts:
+                part = body_parts.pop(0)
+                return {
+                    "type": "http.request",
+                    "body": part,
+                    "more_body": bool(body_parts),
+                }
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],  # NO content-length header at all
+            "client": ("test", 123),
+            "state": {},
+        }
+
+        middleware = ObservabilityMiddleware(app, max_body_bytes=150)
+        asyncio.run(middleware(scope, receive, send))
+
+        assert reached_app["flag"] is False  # application never ran
+        assert received_messages == []       # no body ever forwarded
+        start = next(m for m in sent_messages if m["type"] == "http.response.start")
+        assert start["status"] == 413
+
+    def test_asgi_level_under_limit_replays_body_to_app(self):
+        """Under the cap: app runs and receives the exact buffered body."""
+        from context_proxy.observability.middleware import ObservabilityMiddleware
+
+        seen: list[dict] = []
+
+        async def app(scope, receive, send):
+            while True:
+                message = await receive()
+                seen.append(message)
+                if not message.get("more_body"):
+                    break
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        sent: list[dict] = []
+
+        async def send(message):
+            sent.append(message)
+
+        body_parts = [b"a" * 50, b"b" * 50]
+
+        async def receive():
+            if body_parts:
+                part = body_parts.pop(0)
+                return {"type": "http.request", "body": part, "more_body": bool(body_parts)}
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("test", 123),
+            "state": {},
+        }
+
+        middleware = ObservabilityMiddleware(app, max_body_bytes=150)
+        asyncio.run(middleware(scope, receive, send))
+
+        bodies = b"".join(m.get("body") or b"" for m in seen)
+        assert bodies == b"a" * 50 + b"b" * 50
+        statuses = [m["status"] for m in sent if m["type"] == "http.response.start"]
+        assert statuses == [200]
+
+
+class TestDiagnosticsSecretHygiene:
+    def test_realistic_secrets_never_leak(self, captured_requests):
+        overrides = {
+            "inference": EndpointSettings(
+                base_url="http://upstream.test/v1",
+                api_key="sk-live-supersecret-inference-key",
+            ),
+            "embeddings": EndpointSettings(
+                base_url="http://embed.test/v1",
+                api_key="sk-live-supersecret-embedding-key",
+            ),
+        }
+
+        class RebuildableMemory:
+            async def rebuild_vector_index(self, conversation_id=None, *, force=False):
+                return {"chunks": 0, "chunks_failed": 0, "memories": 0, "memories_failed": 0}
+
+        settings = make_settings().model_copy(update=overrides)
+        app = create_app(
+            settings,
+            llm_client=httpx.AsyncClient(
+                base_url=UPSTREAM, transport=upstream_handler(captured_requests)
+            ),
+            store=None,
+            memory_service=RebuildableMemory(),
+        )
+        with TestClient(app) as client:
+            response = client.get("/internal/v1/diagnostics")
+        assert response.status_code == 200
+        blob = json.dumps(response.json()).lower()
+        for secret in (
+            "sk-live-supersecret-inference-key",
+            "sk-live-supersecret-embedding-key",
+            "api_key",
+            "authorization",
+            "password",
+            "secret",
+            "token",
+        ):
+            assert secret not in blob
+
+
+class TestRateLimiterIdentityPolicy:
+    """Identity policy (documented on RateLimitSettings):
+
+    X-Conversation-ID header -> per-conversation bucket;
+    otherwise client host -> shared host bucket.
+    Body-level conversation ids are intentionally ignored (pre-parse decision).
+    """
+
+    def test_buckets_isolated_per_conversation_identity(self, captured_requests):
+        overrides = {
+            "rate_limit": RateLimitSettings(enabled=True, requests_per_minute=60, burst=1),
+        }
+        # X-Conversation-ID must be a VALID UUID (M2 identity policy); the
+        # limiter keys on the raw header value pre-validation.
+        conv_a = "aaaaaaaa-1111-4111-8111-111111111111"
+        conv_b = "bbbbbbbb-2222-4222-8222-222222222222"
+        with run_client(
+            build_client(captured_requests, settings_overrides=overrides)
+        ) as client:
+            first = client.post(
+                "/v1/chat/completions", json=CHAT_BODY, headers={"X-Conversation-ID": conv_a}
+            )
+            second = client.post(
+                "/v1/chat/completions", json=CHAT_BODY, headers={"X-Conversation-ID": conv_a}
+            )
+            other = client.post(
+                "/v1/chat/completions", json=CHAT_BODY, headers={"X-Conversation-ID": conv_b}
+            )
+        assert first.status_code == 200
+        assert second.status_code == 429  # bucket A exhausted...
+        assert other.status_code == 200   # ...bucket B untouched

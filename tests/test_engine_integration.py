@@ -539,3 +539,153 @@ def test_vector_programming_bug_propagates():
             await pool.close()
 
     asyncio.run(_run())
+
+
+def test_scoped_rebuild_touches_only_target_conversation():
+    """conversation_id scope: A rebuilt (force), B left byte-identical."""
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            memory, store = _services(pool)
+            conv_a, conv_b = str(uuid.uuid4()), str(uuid.uuid4())
+
+            async def seed(conv):
+                await store.reconcile_history(
+                    conv,
+                    [
+                        {"role": "user", "content": f"question for {conv}"},
+                        {"role": "assistant", "content": "answer"},
+                        {"role": "user", "content": "live"},
+                    ],
+                )
+                await memory.create_memory(
+                    MemoryCreate(
+                        kind=MemoryKind.FACT,
+                        content=f"memory fact for {conv}",
+                        conversation_id=conv,
+                    )
+                )
+                await memory.index_completed_turns(conv)
+
+            await seed(conv_a)
+            await seed(conv_b)
+
+            async def chunk_markers():
+                rows = await pool.fetch(
+                    """
+                    SELECT conversation_id::text AS conv, id::text AS cid,
+                           vector_indexed_at
+                    FROM conversation_chunks
+                    WHERE vector_indexed_at IS NOT NULL
+                    """
+                )
+                return {
+                    (r["conv"], r["cid"]): str(r["vector_indexed_at"]) for r in rows
+                }
+
+            before = await chunk_markers()
+            assert len([k for k in before if k[0] == conv_a]) == 1
+            assert len([k for k in before if k[0] == conv_b]) == 1
+
+            summary = await memory.rebuild_vector_index(conv_a, force=True)
+            assert summary["chunks"] == 1
+            assert summary["memories"] == 1
+            assert summary["chunks_failed"] == 0
+            assert summary["memories_failed"] == 0
+
+            after = await chunk_markers()
+
+            # Same series survive; A refreshed, B byte-identical.
+            assert set(after) == set(before)
+            key_b = next(k for k in before if k[0] == conv_b)
+            assert after[key_b] == before[key_b]
+            key_a = next(k for k in before if k[0] == conv_a)
+            # force rebuild re-upserted and re-marked: marker moved forward.
+            assert after[key_a] >= before[key_a]
+
+            # Global rebuild still functions (no scope).
+            global_summary = await memory.rebuild_vector_index(None, force=True)
+            assert global_summary["chunks"] >= 2
+            assert global_summary["memories"] >= 2
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_rebuild_counts_expected_vector_failures():
+    """VectorStoreError -> failures counted, rebuild continues (#Test 1)."""
+    async def _run():
+        from context_proxy.memory.errors import VectorStoreError
+
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            memory, store = _services(pool)
+            conv = str(uuid.uuid4())
+            await store.reconcile_history(
+                conv,
+                [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "a"},
+                    {"role": "user", "content": "live"},
+                ],
+            )
+
+            class OutageStore(RecordingVectorStore):
+                async def upsert(self, points, vector_size):
+                    raise VectorStoreError("qdrant down")
+
+            broken = MemoryService(
+                pool, HashingEmbedder(), OutageStore(),
+                retrieval_settings=RetrievalSettings(),
+            )
+            await broken.create_memory(
+                MemoryCreate(kind=MemoryKind.FACT, content="fact x", conversation_id=conv)
+            )
+            await broken.index_completed_turns(conv)  # chunk exists (vector leg pending)
+            summary = await broken.rebuild_vector_index(conv, force=True)
+            assert summary["chunks_failed"] == 1
+            assert summary["chunks"] == 0
+            assert summary["memories_failed"] == 1
+            assert summary["memories"] == 1
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_rebuild_does_not_swallow_unexpected_errors():
+    """TypeError from the vector store propagates — never silenced (#Test 2)."""
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            memory, store = _services(pool)
+            conv = str(uuid.uuid4())
+            await store.reconcile_history(
+                conv,
+                [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "a"},
+                    {"role": "user", "content": "live"},
+                ],
+            )
+            await memory.index_completed_turns(conv)
+
+            class BuggyStore(RecordingVectorStore):
+                async def upsert(self, points, vector_size):
+                    raise TypeError("programming bug")
+
+            broken = MemoryService(
+                pool, HashingEmbedder(), BuggyStore(),
+                retrieval_settings=RetrievalSettings(),
+            )
+            try:
+                await broken.rebuild_vector_index(conv, force=True)
+            except TypeError:
+                pass  # expected propagation
+            else:
+                pytest.fail("unexpected error was swallowed during rebuild")
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())

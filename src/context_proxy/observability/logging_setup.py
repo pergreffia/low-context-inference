@@ -17,34 +17,47 @@ from typing import Any
 from context_proxy.observability.middleware import current_request_id
 
 _BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
-_KEY_FIELDS = ("api_key", "authorization", "password", "secret", "token")
+_KEY_FIELDS = ("api_key", "authorization", "password", "secret", "token", "credential")
+_REDACTED = "[REDACTED]"
 
 
 def redact_text(value: str) -> str:
-    return _BEARER_RE.sub(r"\1[REDACTED]", value)
+    """Scrub inline Bearer tokens from free text."""
+    return _BEARER_RE.sub(rf"\1{_REDACTED}", value)
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    name = str(key).lower()
+    return any(marker in name for marker in _KEY_FIELDS)
+
+
+def redact(value: Any) -> Any:
+    """Centralized recursive redaction for structured log payloads.
+
+    Strings get bearer scrubbing; sensitive-keyed fields are fully masked at
+    any nesting depth; containers are traversed. Unknown types pass through.
+    """
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, dict):
+        return {
+            key: (_REDACTED if _is_sensitive_key(key) else redact(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        converted = [redact(item) for item in value]
+        return type(value)(converted) if isinstance(value, tuple) else converted
+    return value
 
 
 def _redact_mapping(items: dict[str, Any]) -> dict[str, Any]:
-    safe: dict[str, Any] = {}
-    for key, value in items.items():
-        if any(marker in key.lower() for marker in _KEY_FIELDS):
-            safe[key] = "[REDACTED]"
-        elif isinstance(value, str):
-            safe[key] = redact_text(value)
-        else:
-            safe[key] = value
-    return safe
+    return {key: redact(value) for key, value in items.items()}
 
 
 class RedactionFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.msg = redact_text(str(record.getMessage()))
         record.args = ()
-        if hasattr(record, "__dict__"):
-            for field in ("error", "detail"):
-                value = getattr(record, field, None)
-                if isinstance(value, str) and "Bearer" in value:
-                    setattr(record, field, redact_text(value))
         return True
 
 
@@ -54,7 +67,7 @@ class JsonFormatter(logging.Formatter):
             "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
             "logger": record.name,
-            "event": record.getMessage(),
+            "event": redact_text(record.getMessage()),
             "request_id": current_request_id(),
         }
         reserved = set(vars(logging.LogRecord("%", 0, "", 0, "", (), None)).keys())
@@ -62,7 +75,7 @@ class JsonFormatter(logging.Formatter):
             if key in reserved or key in ("asctime", "message"):
                 continue
             if not key.startswith("_"):
-                payload[key] = value
+                payload[key] = redact(value)
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 

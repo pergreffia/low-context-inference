@@ -206,3 +206,104 @@ def test_redaction_scrubs_bearer_tokens():
 def test_config_validator_rejects_margin_over_limit():
     with pytest.raises(ValueError):
         ContextSettings(model_limit_tokens=1000, safety_margin_tokens=2000)
+
+
+class TestHalfOpenSingleProbe:
+    """HALF_OPEN admits exactly one concurrent probe (M5 review §3)."""
+
+    def test_exactly_one_probe_among_concurrent_callers(self):
+        import threading
+
+        clock = FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, reset_seconds=5, clock=clock)
+        breaker.record_failure()  # OPEN
+        clock.advance(6)          # reset elapsed -> next read becomes HALF_OPEN
+
+        results: list[bool] = []
+        lock = threading.Lock()
+        start = threading.Barrier(16)
+
+        def try_enter():
+            start.wait()
+            allowed = breaker.allow_attempt()
+            with lock:
+                results.append(allowed)
+
+        threads = [threading.Thread(target=try_enter) for _ in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert sorted(results, reverse=True)[0] is True   # exactly one probe...
+        assert sum(results) == 1                          # ...all others fail fast
+
+    def test_failed_probe_reopens_breaker(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, reset_seconds=5, clock=clock)
+        breaker.record_failure()
+        clock.advance(6)
+        assert breaker.state == "half_open"
+        assert breaker.allow_attempt()  # the single probe
+        breaker.record_failure()
+        assert breaker.state == "open"
+        assert not breaker.allow_attempt()
+
+    def test_successful_probe_closes_breaker(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, reset_seconds=5, clock=clock)
+        breaker.record_failure()
+        clock.advance(6)
+        assert breaker.allow_attempt()
+        breaker.record_success()
+        assert breaker.state == "closed"
+        assert breaker.allow_attempt()
+
+    def test_second_concurrent_probe_fails_fast_while_first_in_flight(self):
+        clock = FakeClock()
+        breaker = CircuitBreaker(failure_threshold=1, reset_seconds=5, clock=clock)
+        breaker.record_failure()
+        clock.advance(6)
+        assert breaker.allow_attempt() is True   # probe reserved
+        for _ in range(10):
+            assert breaker.allow_attempt() is False  # everyone else blocked
+
+
+class TestRecursiveRedaction:
+    """Centralized recursive redaction (M5 review §9)."""
+
+    def test_bearer_token_scrubbed_from_text(self):
+        from context_proxy.observability.logging_setup import redact_text
+
+        out = redact_text("upstream said Bearer abc.def-ghi is invalid")
+        assert "abc.def-ghi" not in out
+        assert "Bearer" in out
+
+    def test_sensitive_keys_masked_at_any_depth(self):
+        import json
+
+        from context_proxy.observability.logging_setup import redact
+
+        payload = {
+            "api_key": "sk-top-level",
+            "nested": {
+                "authorization": "Bearer deep-secret",
+                "inner": {"client_secret": "hunter2", "note": "Bearer visible-scrubbed"},
+                "list": [{"password": "p@ss"}, "plain", 42],
+            },
+            "safe": "value",
+        }
+        out = json.loads(json.dumps(redact(payload)))
+        assert out["api_key"] == "[REDACTED]"
+        assert out["nested"]["authorization"] == "[REDACTED]"
+        assert out["nested"]["inner"]["client_secret"] == "[REDACTED]"
+        assert "visible-scrubbed" not in out["nested"]["inner"]["note"]
+        assert out["nested"]["list"][0]["password"] == "[REDACTED]"
+        assert out["nested"]["list"][1] == "plain"
+        assert out["nested"]["list"][2] == 42
+        assert out["safe"] == "value"
+
+    def test_credential_field_name_is_redacted(self):
+        from context_proxy.observability.logging_setup import redact
+
+        assert redact({"credential": "anything-here"}) == {"credential": "[REDACTED]"}

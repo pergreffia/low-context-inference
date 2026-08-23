@@ -579,8 +579,12 @@ class MemoryService:
         (idempotent point ids make duplicate upserts harmless). Memories are
         always re-embedded+upserted (they carry no durable marker). Scope is
         per conversation by default; conversation_id=None rebuilds everything.
+
+        Error classification (M5 review): expected VectorStoreError failures
+        are counted in `chunks_failed` / `memories_failed` and the rebuild
+        continues; unexpected programming errors propagate.
         """
-        scope_clause = "AND conversation_id = $2::uuid" if conversation_id else ""
+        scope_clause = "AND conversation_id = $1::uuid" if conversation_id else ""
         args: list[Any] = []
         if conversation_id:
             args.append(str(conversation_id))
@@ -590,7 +594,7 @@ class MemoryService:
                 await conn.execute(
                     f"""
                     UPDATE conversation_chunks SET vector_indexed_at = NULL
-                    WHERE vector_indexed_at IS NOT NULL {scope_clause}
+                    WHERE TRUE {scope_clause}
                     """,
                     *args,
                 )
@@ -610,37 +614,101 @@ class MemoryService:
             """,
             *args,
         )
-        chunks_ok = memories_ok = 0
+        summary = {
+            "chunks": 0,
+            "chunks_failed": 0,
+            "memories": 0,
+            "memories_failed": 0,
+        }
         for row in chunk_rows:
-            ok = await self._index_chunk(
+            ok = await self._rebuild_chunk(
                 str(row["conversation_id"]),
                 str(row["id"]),
                 row["raw_content"],
                 row["start_seq"],
             )
-            chunks_ok += int(ok)
+            key = "chunks" if ok else "chunks_failed"
+            summary[key] += 1
         for row in memory_rows:
+            # Bypass _embed_and_upsert: its blanket catch implements M3
+            # create-time best-effort semantics and would hide failures here.
+            # The rebuild path needs typed classification instead.
+            vector = await self._safe_embed(row["content"])
+            if vector is None:
+                summary["memories_failed"] += 1
+                summary["memories"] += 1
+                continue
             try:
-                await self._embed_and_upsert(
-                    point_id=str(row["id"]),
-                    text=row["content"],
-                    payload={
-                        "conversation_id": str(row["conversation_id"]),
-                        "kind": row["kind"],
-                        "memory_id": str(row["id"]),
-                    },
+                await self._qdrant.upsert(
+                    [
+                        {
+                            "id": str(row["id"]),
+                            "vector": vector,
+                            "payload": {
+                                "conversation_id": str(row["conversation_id"]),
+                                "kind": row["kind"],
+                                "memory_id": str(row["id"]),
+                            },
+                        }
+                    ],
+                    vector_size=len(vector),
                 )
-            except Exception as exc:  # noqa: BLE001 - rebuild reports, never raises
+            except VectorStoreError as exc:
+                # Expected provider outage: count it and keep rebuilding.
                 logger.warning(
                     "rebuild_memory_upsert_failed", extra={"error": str(exc)}
                 )
-            else:
-                memories_ok += 1
+                summary["memories_failed"] += 1
+            summary["memories"] += 1
         logger.info(
             "vector_index_rebuilt",
-            extra={"chunks": chunks_ok, "memories": memories_ok, "force": force},
+            extra={**summary, "force": force},
         )
-        return {"chunks": chunks_ok, "memories": memories_ok}
+        return summary
+
+    async def _rebuild_chunk(
+        self,
+        conversation_id: str,
+        chunk_id: str,
+        raw_content: str,
+        start_seq: int | None,
+    ) -> bool:
+        """Re-embed+upsert one chunk during a rebuild; typed failure handling.
+
+        Unlike _index_chunk (which keeps M3's blanket retry semantics), the
+        rebuild path must surface programming errors: only VectorStoreError is
+        treated as an expected infrastructure failure here.
+        """
+        vector = await self._safe_embed(raw_content)
+        if vector is None:
+            return False  # embedding leg unavailable: stays retryable
+        try:
+            await self._qdrant.upsert(
+                [
+                    {
+                        "id": chunk_id,
+                        "vector": vector,
+                        "payload": {
+                            "conversation_id": conversation_id,
+                            "kind": "chunk",
+                            "chunk_id": chunk_id,
+                            "start_seq": start_seq,
+                        },
+                    }
+                ],
+                vector_size=len(vector),
+            )
+        except VectorStoreError as exc:
+            logger.warning("rebuild_chunk_upsert_failed", extra={"error": str(exc)})
+            return False
+        await self._pool.execute(
+            """
+            UPDATE conversation_chunks SET vector_indexed_at = now()
+            WHERE id = $1::uuid AND vector_indexed_at IS NULL
+            """,
+            uuid.UUID(chunk_id),
+        )
+        return True
 
     # ----------------------------------------------------------------- helpers
 
