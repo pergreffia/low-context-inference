@@ -9,8 +9,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_healthy
+    # Qdrant is infrastructure reserved for later milestones (vector retrieval,
+    # M3). It is NOT a runtime dependency of context-proxy in M1: proxy startup
+    # must not fail when it is unavailable.
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 
 from fastapi import Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from context_proxy.providers.headers import ensure_content_type
 
 
 def openai_error(
@@ -38,11 +40,27 @@ async def parse_json_body(request: Request) -> dict:
 
 
 def upstream_response(status_code: int, headers: dict[str, str], body: bytes) -> Response:
+    """Forward an upstream buffered response with its own headers intact.
+
+    Content-Type comes from the forwarded headers (a default is applied when
+    the upstream omitted it); bodies are never rewritten.
+    """
     return Response(
         content=body,
         status_code=status_code,
-        media_type="application/json",
-        headers=headers or None,
+        headers=ensure_content_type(headers or {}),
+    )
+
+
+def streaming_response(stream) -> StreamingResponse:
+    """Forward an upstream stream incrementally, preserving its headers."""
+    headers = stream.passthrough_headers()
+    if not any(name.lower() == "content-type" for name in headers):
+        headers["Content-Type"] = "text/event-stream"
+    return StreamingResponse(
+        stream.iter_bytes(),
+        status_code=stream.status_code,
+        headers=headers,
     )
 
 
@@ -50,13 +68,16 @@ async def error_body_response(exc: Exception) -> Response:
     from context_proxy.providers.errors import UpstreamHTTPError, UpstreamUnavailable
 
     if isinstance(exc, UpstreamHTTPError):
+        headers = dict(exc.headers)
         if exc.content_type.startswith("application/json"):
             try:
                 json.loads(exc.body)
+                if not any(n.lower() == "content-type" for n in headers):
+                    headers["Content-Type"] = exc.content_type
                 return Response(
                     content=exc.body,
                     status_code=exc.status_code,
-                    media_type="application/json",
+                    headers=headers,
                 )
             except (ValueError, UnicodeDecodeError):
                 pass
@@ -73,3 +94,4 @@ async def error_body_response(exc: Exception) -> Response:
             status_code=502,
         )
     return openai_error(str(exc), err_type="internal_error", status_code=500)
+

@@ -65,13 +65,27 @@ def upstream_handler(
     return httpx.MockTransport(handler)
 
 
-def make_settings() -> Settings:
+def make_settings(model: str | None = None) -> Settings:
     return Settings(
         _env_file=None,
         server=ServerSettings(port=8080),
         database=DatabaseSettings(url="postgresql://invalid:invalid@localhost:9/none"),
-        inference=EndpointSettings(base_url=UPSTREAM),
+        inference=EndpointSettings(base_url=UPSTREAM, model=model),
     )
+
+
+def client_for_handler(
+    handler,
+    *,
+    model: str | None = None,
+    raise_server_exceptions: bool = True,
+) -> TestClient:
+    settings = make_settings(model=model)
+    app = create_app(
+        settings,
+        llm_client=httpx.AsyncClient(base_url=UPSTREAM, transport=httpx.MockTransport(handler)),
+    )
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 def make_client(captured: list[httpx.Request], **kwargs: Any) -> TestClient:

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
 
 from context_proxy.api.responses import (
     error_body_response,
     openai_error,
     parse_json_body,
+    streaming_response,
     upstream_response,
 )
 from context_proxy.providers.errors import ContextProxyError
@@ -43,12 +43,7 @@ async def chat_completions(request: Request):
             stream = await llm.open_stream(payload)
         except ContextProxyError as exc:
             return await error_body_response(exc)
-        return StreamingResponse(
-            stream.iter_bytes(),
-            status_code=stream.status_code,
-            media_type=stream.media_type,
-            headers=stream.passthrough_headers() or None,
-        )
+        return streaming_response(stream)
 
     try:
         status_code, headers, body = await llm.complete(payload)

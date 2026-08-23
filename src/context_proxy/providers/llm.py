@@ -7,18 +7,22 @@ from typing import Any
 import httpx
 
 from context_proxy.config import EndpointSettings
+from context_proxy.providers.base import LLMStream
 from context_proxy.providers.errors import UpstreamHTTPError, map_upstream_error
+from context_proxy.providers.headers import (
+    filter_response_headers,
+    get_header,
+)
 
 logger = logging.getLogger(__name__)
-
-PASSTHROUGH_RESPONSE_HEADERS = ("x-request-id", "openai-organization", "openai-processing-ms")
 
 
 class OpenAICompatibleLLMProvider:
     """Thin passthrough client for any OpenAI-compatible endpoint.
 
     Responses are treated as opaque protocol data: bodies are never parsed or
-    rewritten (master prompt §6, §30).
+    rewritten (master prompt §6, §30). Header forwarding follows the explicit
+    policy in providers.headers.
     """
 
     def __init__(self, settings: EndpointSettings, client: httpx.AsyncClient | None = None):
@@ -39,49 +43,82 @@ class OpenAICompatibleLLMProvider:
 
     async def list_models(self) -> tuple[int, dict[str, str], bytes]:
         request = self._client.build_request("GET", "/models")
-        try:
-            response = await self._client.send(request)
-        except httpx.HTTPError as exc:
-            raise map_upstream_error(exc) from exc
+        response = await self._send(request)
         return self._pack(response)
 
     async def complete(self, payload: dict[str, Any]) -> tuple[int, dict[str, str], bytes]:
-        request = self._client.build_request("POST", "/chat/completions", json=payload)
-        try:
-            response = await self._client.send(request)
-        except httpx.HTTPError as exc:
-            raise map_upstream_error(exc) from exc
+        request = self._client.build_request(
+            "POST", "/chat/completions", json=self._prepared(payload)
+        )
+        response = await self._send(request)
         return self._pack(response)
 
-    async def open_stream(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
-        request = self._client.build_request("POST", "/chat/completions", json=payload)
+    async def open_stream(self, payload: dict[str, Any]) -> LLMStream:
+        request = self._client.build_request(
+            "POST", "/chat/completions", json=self._prepared(payload)
+        )
         try:
             response = await self._client.send(request, stream=True)
         except httpx.HTTPError as exc:
             raise map_upstream_error(exc) from exc
         if response.status_code >= 400:
             body = await response.aread()
-            content_type = response.headers.get("content-type", "application/json")
-            status_code = response.status_code
-            await response.aclose()
-            raise UpstreamHTTPError(status_code, body, content_type)
-        return _StreamIterator(response)
+            raise UpstreamHTTPError(
+                response.status_code,
+                body,
+                content_type=response.headers.get("content-type", "application/json"),
+                headers=filter_response_headers(response.headers, keep_content_encoding=False),
+            )
+        return UpstreamLLMStream(response)
+
+    async def _send(self, request: httpx.Request) -> httpx.Response:
+        """Send a buffered request; upstream HTTP errors become UpstreamHTTPError.
+
+        Shared by streaming and non-streaming paths so error handling stays
+        consistent (M1.1 §1).
+        """
+        try:
+            response = await self._client.send(request)
+        except httpx.HTTPError as exc:
+            raise map_upstream_error(exc) from exc
+        if response.status_code >= 400:
+            raise UpstreamHTTPError(
+                response.status_code,
+                response.content,
+                content_type=response.headers.get("content-type", "application/json"),
+                headers=filter_response_headers(response.headers, keep_content_encoding=False),
+            )
+        return response
+
+    def _prepared(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Resolve the configured inference model without mutating the caller's payload.
+
+        Policy: INFERENCE__MODEL set -> override; unset -> client value preserved.
+        """
+        if not self._settings.model:
+            return payload
+        prepared = dict(payload)
+        prepared["model"] = self._settings.model
+        return prepared
 
     @staticmethod
     def _pack(response: httpx.Response) -> tuple[int, dict[str, str], bytes]:
-        headers = {
-            name: value
-            for name, value in response.headers.items()
-            if name.lower() in PASSTHROUGH_RESPONSE_HEADERS
-        }
+        headers = filter_response_headers(response.headers, keep_content_encoding=False)
         return response.status_code, headers, response.content
 
 
-class _StreamIterator:
-    """Wraps a streaming upstream response for incremental passthrough."""
+
+class UpstreamLLMStream(LLMStream):
+    """Incremental raw passthrough over an upstream streaming response.
+
+    The upstream connection is closed exactly once: when the downstream
+    iteration finishes or fails (including client disconnects, which surface
+    as generator cancellation).
+    """
 
     def __init__(self, response: httpx.Response):
         self._response = response
+        self._closed = False
 
     @property
     def status_code(self) -> int:
@@ -89,18 +126,19 @@ class _StreamIterator:
 
     @property
     def media_type(self) -> str:
-        return self._response.headers.get("content-type", "text/event-stream")
+        return get_header(self._response.headers, "content-type") or "text/event-stream"
 
     def passthrough_headers(self) -> dict[str, str]:
-        return {
-            name: value
-            for name, value in self._response.headers.items()
-            if name.lower() in PASSTHROUGH_RESPONSE_HEADERS
-        }
+        return filter_response_headers(self._response.headers, keep_content_encoding=True)
 
     async def iter_bytes(self) -> AsyncIterator[bytes]:
         try:
             async for chunk in self._response.aiter_raw():
                 yield chunk
         finally:
+            await self.aclose()
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            self._closed = True
             await self._response.aclose()

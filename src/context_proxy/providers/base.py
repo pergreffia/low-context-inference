@@ -39,6 +39,21 @@ class EmbeddingProvider(Protocol):
 
 
 @runtime_checkable
+class LLMStream(Protocol):
+    """Incremental passthrough handle over an upstream streaming response."""
+
+    @property
+    def status_code(self) -> int: ...
+
+    @property
+    def media_type(self) -> str: ...
+
+    def passthrough_headers(self) -> dict[str, str]: ...
+
+    def iter_bytes(self) -> AsyncIterator[bytes]: ...
+
+
+@runtime_checkable
 class LLMProvider(Protocol):
     async def list_models(self) -> tuple[int, dict[str, str], bytes]:
         """Return (status_code, headers, body) from the models endpoint."""
@@ -48,8 +63,8 @@ class LLMProvider(Protocol):
         """Non-streaming chat completion passthrough."""
         ...
 
-    def open_stream(self, payload: dict[str, Any]) -> AsyncIterator[bytes]:
-        """Streaming chat completion passthrough."""
+    async def open_stream(self, payload: dict[str, Any]) -> LLMStream:
+        """Start a streaming chat completion and return its passthrough handle."""
         ...
 
 

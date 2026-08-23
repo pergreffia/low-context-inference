@@ -8,10 +8,17 @@ class ContextProxyError(Exception):
 
 
 class UpstreamHTTPError(ContextProxyError):
-    def __init__(self, status_code: int, body: bytes, content_type: str = "application/json"):
+    def __init__(
+        self,
+        status_code: int,
+        body: bytes,
+        content_type: str = "application/json",
+        headers: dict[str, str] | None = None,
+    ):
         self.status_code = status_code
         self.body = body
         self.content_type = content_type
+        self.headers = headers or {}
         super().__init__(f"upstream returned {status_code}")
 
 

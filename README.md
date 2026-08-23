@@ -28,7 +28,18 @@ cp .env.example .env   # adjust inference endpoint
 uvicorn context_proxy.main:app --host 0.0.0.0 --port 8080
 ```
 
-PostgreSQL is optional at M1: if unreachable the proxy logs a warning and serves passthrough in degraded mode.
+### PostgreSQL availability
+
+- **Local process startup**: PostgreSQL is optional at M1. If unreachable, the proxy logs a warning and serves inference passthrough in degraded mode (`/healthz` reports `database: degraded`). This is intentional graceful degradation, not a weakening of the source-of-truth design.
+- **Docker Compose deployment**: PostgreSQL is a hard dependency — the standard Compose stack waits for it to be healthy before starting the proxy.
+
+### Qdrant
+
+Qdrant is defined in Docker Compose as infrastructure reserved for later milestones (vector retrieval, M3). It is **not** a runtime dependency of `context-proxy` in M1: the proxy starts and runs without it. It becomes a runtime dependency when vector retrieval is implemented.
+
+## Model selection
+
+If `INFERENCE__MODEL` is set, it overrides the client's `model` field on chat completions (streaming and non-streaming). If unset, the client's model is forwarded unchanged. `/v1/models` is always passed through as-is.
 
 ## Docker
 
@@ -50,7 +61,7 @@ API_KEY=unused
 MODEL=<model served by your inference endpoint>
 ```
 
-The proxy forwards requests to the configured inference endpoint and passes responses through unchanged.
+The proxy forwards requests to the configured inference endpoint and passes responses through unchanged (response bodies are never rewritten; hop-by-hop headers are stripped).
 
 ## Tests
 
