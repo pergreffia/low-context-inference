@@ -423,3 +423,176 @@ def test_api_level_concurrent_identical_full_history():
             await pool.close()
 
     asyncio.run(_run())
+
+
+def test_concurrent_assistant_responses_single_continuation(caplog):
+    """M2.3 §5–§6: X/Y race -> exactly one assistant persisted, both clients OK."""
+
+    async def _run():
+        from context_proxy.config import Settings
+        from context_proxy.main import create_app
+
+        pool, store = await _make_store()
+        try:
+            conv = str(uuid.uuid4())
+            await _clean(pool, conv)
+            base = [_user("A"), _assistant("B")]
+            await store.reconcile_history(conv, base)
+
+            upstream_hits = {"n": 0}
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                upstream_hits["n"] += 1
+                content = "X" if upstream_hits["n"] == 1 else "Y"
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": f"chatcmpl-{content}",
+                        "model": "test-model",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": content},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    },
+                )
+
+            settings = Settings(_env_file=None)
+            app = create_app(
+                settings,
+                llm_client=httpx.AsyncClient(
+                    base_url=str(settings.inference.base_url),
+                    transport=httpx.MockTransport(handler),
+                ),
+                store=store,
+            )
+            app.state.store = store
+
+            transport = httpx.ASGITransport(app=app)
+            payload = {"model": "m", "messages": base, "conversation_id": conv}
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                with caplog.at_level(logging.WARNING, logger="context_proxy.request"):
+                    responses = await asyncio.gather(
+                        client.post("/v1/chat/completions", json=payload),
+                        client.post("/v1/chat/completions", json=payload),
+                    )
+
+            # both clients receive their own generated response
+            assert all(r.status_code == 200 for r in responses)
+            bodies = {r.json()["choices"][0]["message"]["content"] for r in responses}
+            assert bodies == {"X", "Y"}
+
+            # persistence: exactly ONE continuation beyond the base turn
+            persisted = await store.get_messages(conv)
+            assert persisted[:2] == base
+            continuations = persisted[2:]
+            assert len(continuations) == 1
+            assert continuations[0]["role"] == "assistant"
+            assert continuations[0]["content"] in {"X", "Y"}
+            tail = [m["content"] for m in persisted[-2:]]
+            assert not (tail == ["X", "Y"] or tail == ["Y", "X"])
+            assert await _seqs(pool, conv) == [0, 1, 2]
+
+            # logging: exactly one conflict, no unexpected failure
+            conflicts = [
+                r for r in caplog.records if r.message == "assistant_persistence_conflict"
+            ]
+            failures = [
+                r for r in caplog.records if r.message == "assistant_persistence_failed"
+            ]
+            assert len(conflicts) == 1
+            assert failures == []
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_streaming_concurrent_assistant_conflicts_keep_streams_intact(caplog):
+    """M2.3 §9: losing streaming response still fully reaches its client."""
+
+    async def _run():
+        from context_proxy.config import Settings
+        from context_proxy.main import create_app
+
+        pool, store = await _make_store()
+        try:
+            conv = str(uuid.uuid4())
+            await _clean(pool, conv)
+            base = [_user("A"), _assistant("B")]
+            await store.reconcile_history(conv, base)
+
+            upstream_hits = {"n": 0}
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                upstream_hits["n"] += 1
+                content = "X" if upstream_hits["n"] == 1 else "Y"
+
+                def sse_for(content: str):
+                    async def agen():
+                        role = (
+                            b'data: {"model":"m","choices":[{"index":0,'
+                            b'"delta":{"role":"assistant"}}]}\n\n'
+                        )
+                        delta = (
+                            f'data: {{"choices":[{{"index":0,'
+                            f'"delta":{{"content":"{content}"}},"finish_reason":null}}]}}\n\n'
+                        ).encode()
+                        yield role
+                        yield delta
+                        yield b"data: [DONE]\n\n"
+
+                    return agen()
+
+                return httpx.Response(
+                    200,
+                    content=sse_for(content),
+                    headers={"content-type": "text/event-stream"},
+                )
+
+            settings = Settings(_env_file=None)
+            app = create_app(
+                settings,
+                llm_client=httpx.AsyncClient(
+                    base_url=str(settings.inference.base_url),
+                    transport=httpx.MockTransport(handler),
+                ),
+                store=store,
+            )
+            app.state.store = store
+
+            transport = httpx.ASGITransport(app=app)
+            payload = {"model": "m", "messages": base, "stream": True, "conversation_id": conv}
+
+            async def consume(client) -> bytes:
+                async with client.stream(
+                    "POST", "/v1/chat/completions", json=payload
+                ) as response:
+                    assert response.status_code == 200
+                    return b"".join([chunk async for chunk in response.aiter_bytes()])
+
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                with caplog.at_level(logging.WARNING, logger="context_proxy.request"):
+                    bodies = await asyncio.gather(consume(client), consume(client))
+
+            # both streams delivered completely, each its own response
+            assert all(b.endswith(b"data: [DONE]\n\n") for b in bodies)
+            assert {b for b in bodies} and len(bodies) == 2
+
+            persisted = await store.get_messages(conv)
+            assert persisted[:2] == base
+            continuations = [m for m in persisted[2:] if m["role"] == "assistant"]
+            assert len(continuations) == 1  # only one continuation committed
+            assert continuations[0]["content"] in {"X", "Y"}
+            assert await _seqs(pool, conv) == [0, 1, 2]
+
+            conflicts = [
+                r for r in caplog.records if r.message == "assistant_persistence_conflict"
+            ]
+            assert len(conflicts) == 1
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())

@@ -114,18 +114,38 @@ async def chat_completions(request: Request):
     out_payload = {**payload, "messages": plan.messages}
 
     async def persist_assistant(message: dict | None, metadata: dict | None = None) -> None:
-        """Persist the assistant response via reconciliation.
+        """Best-effort assistant persistence (M2.3 §1–§3).
 
         Concurrent identical requests each produce a real inference response;
-        only the FIRST response reconciles cleanly. Later ones diverge at the
-        assistant index and are skipped (warning) so the stored history never
-        contains duplicate fabricated replies.
+        only the FIRST continuation reconciles cleanly. A loser diverges at the
+        assistant index: the committed history stays source of truth, nothing
+        is appended, and the already-generated upstream response still reaches
+        its client untouched. Expected conflicts and unexpected failures get
+        distinct structured events; neither alters the HTTP response.
         """
-        if store is not None and message is not None:
+        if store is None or message is None:
+            return
+        try:
             await store.reconcile_history(
                 conversation_id,
                 [*messages, message],
                 metadata=metadata,
+            )
+        except HistoryDivergenceError as exc:
+            logger.warning(
+                "assistant_persistence_conflict",
+                extra={
+                    "conversation_id": conversation_id,
+                    "index": exc.index,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - passthrough first, always
+            logger.warning(
+                "assistant_persistence_failed",
+                extra={
+                    "conversation_id": conversation_id,
+                    "error": str(exc),
+                },
             )
 
     if payload.get("stream") is True:
@@ -158,9 +178,13 @@ async def chat_completions(request: Request):
                 )
                 if value is not None
             }
-            await persist_assistant(message, metadata or None)
         except Exception as exc:  # noqa: BLE001 - opaque passthrough first
-            logger.warning("assistant_persistence_failed", extra={"error": str(exc)})
+            logger.warning(
+                "assistant_persistence_failed",
+                extra={"conversation_id": conversation_id, "error": str(exc)},
+            )
+        else:
+            await persist_assistant(message, metadata or None)
 
     response = upstream_response(status_code, headers, body)
     for name, value in extra_headers.items():

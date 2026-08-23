@@ -318,3 +318,96 @@ def test_non_streaming_metadata_persisted():
         r = client.post("/v1/chat/completions", json=chat_payload())
     assert r.status_code == 200
     assert any(m.get("finish_reason") == "stop" and m.get("usage") for m in metadata_calls)
+
+
+class FlakyOnceStore(FakeConversationStore):
+    """Inbound passes; the NEXT reconcile (assistant step) fails once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def reconcile_history(self, conversation_id, messages, metadata=None):
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("simulated db outage")
+        return await super().reconcile_history(conversation_id, messages, metadata)
+
+
+class AlwaysConflictStore(FakeConversationStore):
+    """Inbound reconciliation passes; assistant persistence always diverges."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def reconcile_history(self, conversation_id, messages, metadata=None):
+        self.calls += 1
+        if self.calls == 1:
+            return await super().reconcile_history(conversation_id, messages, metadata)
+        from context_proxy.conversation.store import HistoryDivergenceError
+
+        raise HistoryDivergenceError(conversation_id, 99)
+
+
+def test_persistence_failure_after_inference_still_serves_client(caplog):
+    """M2.3 §7: assistant persistence explodes -> client still gets response."""
+    import logging
+
+    store = FlakyOnceStore()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=CHAT_RESPONSE)
+
+    client = client_for_handler(handler, store=store)
+    conv = "12121212-1212-1212-1212-121212121212"
+    payload = {**chat_payload(), "conversation_id": conv}
+    with client, caplog.at_level(logging.WARNING, logger="context_proxy.request"):
+        r1 = client.post("/v1/chat/completions", json=payload)
+        assert r1.status_code == 200
+        assert r1.json() == CHAT_RESPONSE  # exact inference response preserved
+
+        events = [r.message for r in caplog.records]
+        assert "assistant_persistence_failed" in events
+        assert "assistant_persistence_conflict" not in events
+
+        # store usable afterwards: next request persists normally
+        # (turn 1 lost its assistant to the outage; turn 2 completes fully)
+        r2 = client.post("/v1/chat/completions", json=payload)
+        assert r2.status_code == 200
+        assert [(m["role"], m["content"]) for m in store.conversations[conv]] == [
+            ("user", "hi"),
+            ("assistant", "hello"),
+        ]
+
+
+def test_conflict_and_failure_events_are_distinct(caplog):
+    """M2.3 §8: expected conflict and unexpected failure log different events."""
+    import logging
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=CHAT_RESPONSE)
+
+    # expected concurrency conflict
+    conflict_store = AlwaysConflictStore()
+    client = client_for_handler(handler, store=conflict_store)
+    with client, caplog.at_level(logging.WARNING, logger="context_proxy.request"):
+        r = client.post("/v1/chat/completions", json=chat_payload())
+    assert r.status_code == 200  # inference passthrough unaffected
+    conflicts = [r for r in caplog.records if r.message == "assistant_persistence_conflict"]
+    failures = [r for r in caplog.records if r.message == "assistant_persistence_failed"]
+    assert len(conflicts) >= 1
+    assert conflicts[0].index == 99  # type: ignore[attr-defined]
+    assert failures == []
+
+    # unexpected persistence exception
+    caplog.clear()
+    failing_store = FlakyOnceStore()
+    client = client_for_handler(handler, store=failing_store)
+    with client, caplog.at_level(logging.WARNING, logger="context_proxy.request"):
+        r = client.post("/v1/chat/completions", json=chat_payload())
+    assert r.status_code == 200
+    failures = [r for r in caplog.records if r.message == "assistant_persistence_failed"]
+    conflicts = [r for r in caplog.records if r.message == "assistant_persistence_conflict"]
+    assert len(failures) == 1
+    assert conflicts == []
