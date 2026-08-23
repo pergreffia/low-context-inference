@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,6 +10,10 @@ class ServerSettings(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
     log_level: str = "INFO"
+    # M5: structured JSON logs for log shippers; False keeps human-readable.
+    log_json: bool = False
+    # Reject oversized request bodies before parsing (M5 resource limits).
+    max_body_bytes: int = Field(default=8 * 1024 * 1024, gt=0)
 
 
 class EndpointSettings(BaseModel):
@@ -79,6 +83,35 @@ class AssemblySettings(BaseModel):
     retrieved_budget_tokens: int = Field(default=4000, ge=0)
 
 
+class ResilienceSettings(BaseModel):
+    """Upstream resilience (M5): retries + circuit breaker.
+
+    Retries apply ONLY to transport-level failures before any response byte
+    is received (connect errors, connect timeouts). Upstream HTTP error
+    responses are answers, never retried. Streaming: no retry once the stream
+    opened.
+    """
+
+    max_retries: int = Field(default=2, ge=0)
+    backoff_base_seconds: float = Field(default=0.2, ge=0)
+    backoff_max_seconds: float = Field(default=2.0, ge=0)
+    breaker_failure_threshold: int = Field(default=5, ge=1)
+    breaker_reset_seconds: float = Field(default=30.0, gt=0)
+
+
+class RateLimitSettings(BaseModel):
+    """In-process token-bucket rate limiting (M5).
+
+    Single-instance scope by design (master prompt §2.6: no unnecessary
+    infrastructure — no Redis). Keyed per conversation id when available,
+    else per client host.
+    """
+
+    enabled: bool = False
+    requests_per_minute: int = Field(default=120, gt=0)
+    burst: int = Field(default=30, gt=0)
+
+
 class ContextSettings(BaseModel):
     """Context budget configuration (master prompt §14, §15).
 
@@ -97,6 +130,12 @@ class ContextSettings(BaseModel):
     def usable_budget_tokens(self) -> int:
         return self.model_limit_tokens - self.safety_margin_tokens
 
+    @model_validator(mode="after")
+    def _margin_within_limit(self) -> ContextSettings:
+        if self.safety_margin_tokens >= self.model_limit_tokens:
+            raise ValueError("safety_margin_tokens must be smaller than model_limit_tokens")
+        return self
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -114,6 +153,8 @@ class Settings(BaseSettings):
     qdrant: QdrantSettings = QdrantSettings()
     retrieval: RetrievalSettings = RetrievalSettings()
     memory: MemorySettings = MemorySettings()
+    resilience: ResilienceSettings = ResilienceSettings()
+    rate_limit: RateLimitSettings = RateLimitSettings()
     compact: EndpointSettings = EndpointSettings(
         base_url="http://localhost:8001/v1",
         api_key="local",

@@ -15,7 +15,11 @@ from context_proxy.db.database import Database
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
 from context_proxy.memory.qdrant import QdrantVectorStore
 from context_proxy.memory.service import MemoryService
+from context_proxy.observability.logging_setup import configure_logging
+from context_proxy.observability.middleware import ObservabilityMiddleware
+from context_proxy.observability.ratelimit import RateLimiter
 from context_proxy.providers.llm import OpenAICompatibleLLMProvider
+from context_proxy.providers.resilience import CircuitBreaker
 
 logger = logging.getLogger("context_proxy")
 
@@ -34,9 +38,20 @@ def create_app(
     settings = settings or load_settings()
     database = database or Database(settings.database)
     owned_clients: list[httpx.AsyncClient] = []
+    breaker = CircuitBreaker(
+        failure_threshold=settings.resilience.breaker_failure_threshold,
+        reset_seconds=settings.resilience.breaker_reset_seconds,
+    )
+    rate_limiter = RateLimiter(
+        requests_per_minute=settings.rate_limit.requests_per_minute,
+        burst=settings.rate_limit.burst,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        configure_logging(settings.server.log_level, log_json=settings.server.log_json)
+        app.state.settings = settings
+        app.state.breaker = breaker
         await database.start()
         app.state.database = database
         if store is not None:
@@ -85,13 +100,26 @@ def create_app(
         else:
             app.state.memory = None
         yield
+        # Graceful shutdown (§17): each owned resource is closed in isolation —
+        # one cleanup failure must not prevent the others from being released.
         for client in owned_clients:
-            await client.aclose()
-        await database.close()
+            try:
+                await client.aclose()
+            except Exception as exc:  # noqa: BLE001 - isolation is the point
+                logger.warning("client_close_failed", extra={"error": str(exc)})
+        try:
+            await database.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("database_close_failed", extra={"error": str(exc)})
 
     app = FastAPI(title="Context Proxy", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
-    app.state.llm = OpenAICompatibleLLMProvider(settings.inference, client=llm_client)
+    app.state.llm = OpenAICompatibleLLMProvider(
+        settings.inference,
+        client=llm_client,
+        resilience=settings.resilience,
+        breaker=breaker,
+    )
     # The engine owns no network resources: it is plain configuration plus
     # pure selection logic, so it can be built eagerly (M4).
     if context_engine is not None:
@@ -107,6 +135,44 @@ def create_app(
         app.state.context_engine = None
     app.include_router(router)
     app.include_router(internal_router)
+
+    # M5 observability outermost: request-id, metrics, resource limits.
+    app.add_middleware(
+        ObservabilityMiddleware,
+        max_body_bytes=settings.server.max_body_bytes,
+        rate_limiter=rate_limiter,
+        rate_limit_enabled=settings.rate_limit.enabled,
+    )
+
+    @app.get("/metrics")
+    async def prometheus_metrics():
+        from fastapi.responses import Response
+
+        from context_proxy.observability.metrics import REGISTRY
+
+        return Response(
+            content=REGISTRY.render(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    @app.get("/readyz")
+    async def readyz():
+        """Readiness: process can accept traffic; dependency states reported.
+
+        PostgreSQL is optional by design (§31 degraded passthrough), so it
+        degrades readiness reporting rather than failing it.
+        """
+        db_state = "degraded"
+        if database.available:
+            try:
+                await database.ping()
+                db_state = "ok"
+            except Exception:  # noqa: BLE001
+                db_state = "degraded"
+        return {
+            "ready": True,
+            "checks": {"database": db_state, "circuit_breaker": breaker.state},
+        }
 
     @app.get("/healthz")
     async def healthz():

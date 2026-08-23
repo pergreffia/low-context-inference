@@ -17,6 +17,7 @@ from context_proxy.context.engine import (
 )
 from context_proxy.context.engine import separate_current_request
 from context_proxy.context.query import extract_retrieval_query
+from context_proxy.db.database import Database
 from context_proxy.memory.errors import RetrievalError
 from context_proxy.memory.models import (
     MemoryCreate,
@@ -92,6 +93,52 @@ async def index_conversation(conversation_id: str, request: Request):
     memory = _memory(request)
     created = await memory.index_completed_turns(parsed)
     return {"chunks_created": created}
+
+
+@router.post("/index/rebuild")
+async def rebuild_index(request: Request, conversation_id: str | None = None, force: bool = False):
+    """Rebuild the derived Qdrant index from authoritative PostgreSQL (M5)."""
+    memory = _memory(request)
+    parsed = _parse_uuid(conversation_id, "conversation_id") if conversation_id else None
+    summary = await memory.rebuild_vector_index(parsed, force=force)
+    return {"status": "ok", **summary}
+
+
+@router.get("/diagnostics")
+async def diagnostics(request: Request):
+    """Operational snapshot (M5). Never includes secrets or raw content."""
+    app_state = request.app.state
+    settings = app_state.settings
+    database: Database | None = getattr(app_state, "database", None)
+    db_ok = False
+    if database is not None and database.available:
+        try:
+            await database.ping()
+            db_ok = True
+        except Exception:  # noqa: BLE001 - reported, never raised to client
+            db_ok = False
+    breaker = getattr(app_state, "breaker", None)
+    return {
+        "database": {
+            "available": bool(database and database.available),
+            "reachable": db_ok,
+            "pool_size": getattr(getattr(database, "pool", None), "get_size", lambda: 0)(),
+        },
+        "memory_service": app_state.memory is not None,
+        "context_engine": {
+            "enabled": app_state.context_engine is not None,
+            "assembly_enabled": settings.assembly.enabled,
+        },
+        "resilience": {
+            "max_retries": settings.resilience.max_retries,
+            "breaker_state": breaker.state if breaker else "unknown",
+        },
+        "rate_limit": {
+            "enabled": settings.rate_limit.enabled,
+            "requests_per_minute": settings.rate_limit.requests_per_minute,
+        },
+        "inference": {"base_url": settings.inference.base_url},
+    }
 
 
 @router.post("/conversations/{conversation_id}/context/preview")

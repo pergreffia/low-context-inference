@@ -4,11 +4,28 @@ Model-agnostic context management proxy exposing an OpenAI-compatible API. Lets 
 
 See `context-proxy-master-prompt.md` for the full design.
 
-## Status: M4 — Context Assembly Engine
+## Status: M5 — Production Hardening / Operations
 
-M3 memory service plus a dedicated **Context Assembly Engine** (`context/engine.py`) that decides what context actually reaches the model:
+M4 context assembly plus operational hardening (`observability/`, `providers/resilience.py`), without changing core semantic behavior:
 
-```text
+- **Structured logging**: `SERVER__LOG_JSON=true` for JSON lines; every request carries a correlation id (inbound `X-Request-ID` honored, else generated and echoed); a redaction filter scrubs bearer tokens/api keys from log output.
+- **Metrics**: dependency-free Prometheus text endpoint at `/metrics` — request totals & latency histogram, upstream latency, token accounting (`context_proxy_llm_tokens_total{direction}`), degradation events, rate-limit rejections, circuit state gauge.
+- **Latency breakdown**: per-request stage timings (`inbound_persistence`, `context_assembly`) logged in `request_completed`.
+- **Resilience**: bounded retries with full-jitter backoff for upstream TRANSPORT failures only (never for HTTP error responses, never after a stream opened) guarded by a per-endpoint circuit breaker (threshold/reset configurable via `RESILIENCE__*`) that fails fast with `upstream_unavailable`.
+- **Rate limiting**: in-process token bucket (`RATE_LIMIT__*`, single-instance scope by design), OpenAI-style 429 + `Retry-After`, keyed by conversation identity.
+- **Resource limits**: oversized bodies rejected pre-parse with 413 `request_too_large` (`SERVER__MAX_BODY_BYTES`).
+- **Configuration validation**: e.g. safety margin must be smaller than model limit.
+- **Health/readiness**: `/healthz` liveness (existing), `/readyz` readiness with dependency checks; graceful shutdown closes owned resources in isolation.
+- **Operational endpoints**: `/internal/v1/diagnostics` (component snapshot, no secrets), `/internal/v1/index/rebuild?force=` — rebuilds the derived Qdrant index from authoritative PostgreSQL.
+- **Production image**: non-root user, HEALTHCHECK, worker scaling via `SERVER__WEB_CONCURRENCY`; CI builds the image.
+
+Not yet implemented: distributed rate limiting/metrics backends, OTel tracing export, load-testing harness automation (a concurrency smoke test ships instead).
+
+## Previous milestones
+
+### M4 — Context Assembly Engine
+
+M3 memory service plus a dedicated **Context Assembly Engine** (`context/engine.py`) that decides what context actually reaches the model:```text
 candidate fusion → deduplication → supersession filtering
     → relevance scoring → MMR diversity → budget allocation
     → packing → ContextPlan

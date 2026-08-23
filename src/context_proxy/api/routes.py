@@ -27,6 +27,8 @@ from context_proxy.conversation.identity import (
 )
 from context_proxy.conversation.store import HistoryDivergenceError
 from context_proxy.memory.errors import RetrievalError
+from context_proxy.observability.metrics import record_tokens
+from context_proxy.observability.middleware import record_stage
 from context_proxy.providers.errors import ContextProxyError
 
 router = APIRouter()
@@ -37,6 +39,12 @@ def _conversation_headers(conversation_id: str | None) -> dict[str, str]:
     if conversation_id is None:
         return {}
     return {RESPONSE_CONVERSATION_HEADER: conversation_id}
+
+
+def _now() -> float:
+    import time
+
+    return time.monotonic()
 
 
 @router.get("/v1/models")
@@ -82,9 +90,11 @@ async def chat_completions(request: Request):
     #    divergent histories are rejected before any inference call (M2.1 §1).
     #    Degraded mode (no store) skips persistence entirely.
     if store is not None:
+        stage_start = _now()
         try:
             await store.ensure_conversation(conversation_id)
             await store.reconcile_history(conversation_id, payload.get("messages") or [])
+            record_stage(request, "inbound_persistence", stage_start)
         except HistoryDivergenceError as exc:
             return openai_error(
                 str(exc),
@@ -109,6 +119,7 @@ async def chat_completions(request: Request):
     messages = payload.get("messages") or []
     tools = payload.get("tools")
     engine = getattr(app_state, "context_engine", None)
+    stage_start = _now()
     try:
         if engine is not None:
             retrieved: list = []
@@ -148,6 +159,7 @@ async def chat_completions(request: Request):
             status_code=400,
             headers=extra_headers,
         )
+    record_stage(request, "context_assembly", stage_start)
     out_payload = {**payload, "messages": out_messages}
 
     async def persist_assistant(message: dict | None, metadata: dict | None = None) -> None:
@@ -161,7 +173,11 @@ async def chat_completions(request: Request):
         distinct structured events; neither alters the HTTP response.
         Indexing completed turns runs after persistence and can never affect
         the response either.
+
+        M5: token accounting happens here FIRST — it must work even when the
+        store is degraded (persistence is optional, accounting is not).
         """
+        record_tokens(metadata.get("usage") if metadata else None)
         if store is None or message is None:
             return
         try:
@@ -229,8 +245,8 @@ async def chat_completions(request: Request):
             stream = await llm.open_stream(out_payload)
         except ContextProxyError as exc:
             return await error_body_response(exc)
-        if store is not None:
-            stream = PersistingLLMStream(stream, persist_assistant)
+        # Always wrap: token accounting must survive a degraded store (M5).
+        stream = PersistingLLMStream(stream, persist_assistant)
         response = streaming_response(stream)
         for name, value in extra_headers.items():
             response.headers[name] = value
@@ -241,7 +257,7 @@ async def chat_completions(request: Request):
     except ContextProxyError as exc:
         return await error_body_response(exc)
 
-    if store is not None and 200 <= status_code < 300:
+    if 200 <= status_code < 300:
         try:
             parsed = json.loads(body)
             message = parsed["choices"][0]["message"]
@@ -254,13 +270,16 @@ async def chat_completions(request: Request):
                 )
                 if value is not None
             }
+            # M5: token accounting is independent of persistence availability.
+            record_tokens(metadata.get("usage"))
         except Exception as exc:  # noqa: BLE001 - opaque passthrough first
             logger.warning(
                 "assistant_persistence_failed",
                 extra={"conversation_id": conversation_id, "error": str(exc)},
             )
         else:
-            await persist_assistant(message, metadata or None)
+            if store is not None:
+                await persist_assistant(message, metadata or None)
 
     response = upstream_response(status_code, headers, body)
     for name, value in extra_headers.items():

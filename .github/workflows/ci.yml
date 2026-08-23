@@ -43,3 +43,16 @@ jobs:
       # Migrations are applied by the suite itself (apply_migrations); the job
       # fails if ANY integration test fails, including the full M3 memory set.
       - run: pytest -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # M5: production image must keep building (non-root, healthcheck).
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: context-proxy:ci

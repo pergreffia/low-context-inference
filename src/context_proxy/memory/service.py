@@ -563,6 +563,85 @@ class MemoryService:
         out.sort(key=lambda h: -h["rank"])
         return out[:limit]
 
+    # ----------------------------------------------------------------- rebuild
+
+    async def rebuild_vector_index(
+        self,
+        conversation_id: uuid.UUID | str | None = None,
+        *,
+        force: bool = False,
+    ) -> dict[str, int]:
+        """Rebuild the derived Qdrant index from PostgreSQL (M5 §12).
+
+        PostgreSQL is authoritative; this procedure exists precisely because
+        the vector index is rebuildable. With force=True every chunk's
+        vector_indexed_at is reset first so already-marked chunks are re-upserted
+        (idempotent point ids make duplicate upserts harmless). Memories are
+        always re-embedded+upserted (they carry no durable marker). Scope is
+        per conversation by default; conversation_id=None rebuilds everything.
+        """
+        scope_clause = "AND conversation_id = $2::uuid" if conversation_id else ""
+        args: list[Any] = []
+        if conversation_id:
+            args.append(str(conversation_id))
+
+        if force:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"""
+                    UPDATE conversation_chunks SET vector_indexed_at = NULL
+                    WHERE vector_indexed_at IS NOT NULL {scope_clause}
+                    """,
+                    *args,
+                )
+
+        chunk_rows = await self._pool.fetch(
+            f"""
+            SELECT id, conversation_id, raw_content, start_seq FROM conversation_chunks
+            WHERE TRUE {scope_clause}
+            ORDER BY conversation_id, start_seq
+            """,
+            *args,
+        )
+        memory_rows = await self._pool.fetch(
+            f"""
+            SELECT id, conversation_id, kind, content FROM memory_records
+            WHERE status = 'active' {scope_clause}
+            """,
+            *args,
+        )
+        chunks_ok = memories_ok = 0
+        for row in chunk_rows:
+            ok = await self._index_chunk(
+                str(row["conversation_id"]),
+                str(row["id"]),
+                row["raw_content"],
+                row["start_seq"],
+            )
+            chunks_ok += int(ok)
+        for row in memory_rows:
+            try:
+                await self._embed_and_upsert(
+                    point_id=str(row["id"]),
+                    text=row["content"],
+                    payload={
+                        "conversation_id": str(row["conversation_id"]),
+                        "kind": row["kind"],
+                        "memory_id": str(row["id"]),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - rebuild reports, never raises
+                logger.warning(
+                    "rebuild_memory_upsert_failed", extra={"error": str(exc)}
+                )
+            else:
+                memories_ok += 1
+        logger.info(
+            "vector_index_rebuilt",
+            extra={"chunks": chunks_ok, "memories": memories_ok, "force": force},
+        )
+        return {"chunks": chunks_ok, "memories": memories_ok}
+
     # ----------------------------------------------------------------- helpers
 
     async def _safe_embed(self, text: str) -> list[float] | None:
