@@ -57,20 +57,41 @@ class MemoryService:
     # ------------------------------------------------------------------ chunks
 
     async def index_completed_turns(self, conversation_id: uuid.UUID | str) -> int:
-        """Chunk every completed turn newer than the watermark; returns chunks.
+        """Chunk new completed turns, then durably vector-index pending chunks.
 
-        Incremental (M3 review §5): only messages with seq > conversations.
-        last_indexed_seq are scanned; after the pass the watermark advances to
-        the newest seen seq. Idempotency is doubly guaranteed: the watermark
-        plus the unique (conversation_id, start_seq) constraint.
+        Two distinct progress concepts (M3 final review §2):
 
-        A turn = user message plus the following non-user messages (tool calls
-        stay attached to their results). The trailing turn of each pass is
-        never chunked — it is still the live recent interaction. System
-        messages are excluded: they remain permanent raw context.
+        - conversations.last_chunked_seq: PostgreSQL chunking watermark;
+        - conversation_chunks.vector_indexed_at: NULL until embedding AND
+          Qdrant upsert both succeeded for that chunk.
 
-        Concurrency-safe: takes the conversation row lock so two concurrent
-        indexing passes serialize instead of racing on the watermark.
+        Every invocation retries chunks whose vector_indexed_at is NULL —
+        partial embedding/Qdrant failures are recovered automatically without
+        a manual rebuild. Concurrency: chunking takes the conversation row
+        lock; duplicate Qdrant upserts are harmless and the marker update only
+        fires after success.
+        """
+        conversation_id = str(conversation_id)
+        created, _settled_end = await self._chunk_new_turns(conversation_id)
+        indexed = await self._index_pending_chunks(conversation_id)
+        if created or indexed:
+            logger.info(
+                "indexing_pass_completed",
+                extra={
+                    "conversation_id": conversation_id,
+                    "chunks_created": created,
+                    "vectors_indexed": indexed,
+                },
+            )
+        return created
+
+    async def _chunk_new_turns(self, conversation_id: str) -> tuple[int, int | None]:
+        """Create missing turn chunks; returns (created, settled_end_seq).
+
+        Incremental: scans from the user message at-or-before the chunking
+        watermark so a turn straddling the boundary is reconsidered once it
+        completes (its insert no-ops via the unique constraint). The trailing
+        unit stays raw — it is still the live interaction.
         """
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -79,7 +100,7 @@ class MemoryService:
                     conversation_id,
                 )
                 watermark = await conn.fetchval(
-                    "SELECT last_indexed_seq FROM conversations WHERE id = $1::uuid",
+                    "SELECT last_chunked_seq FROM conversations WHERE id = $1::uuid",
                     conversation_id,
                 )
                 # Window starts at the user message AT OR BEFORE the watermark:
@@ -105,7 +126,7 @@ class MemoryService:
                     boundary,
                 )
                 if not rows:
-                    return 0
+                    return 0, watermark if watermark is not None else None
 
                 units: list[tuple[int, list[asyncpg.Record]]] = []
                 current: list[asyncpg.Record] = []
@@ -129,36 +150,82 @@ class MemoryService:
                         created += 1
                     settled_end = unit_rows[-1]["seq"]
 
-                if settled_end is not None and (watermark is None or settled_end > watermark):
+                if settled_end is not None and (
+                    watermark is None or settled_end > watermark
+                ):
                     await conn.execute(
                         """
-                        UPDATE conversations SET last_indexed_seq = $2
+                        UPDATE conversations SET last_chunked_seq = $2
                         WHERE id = $1::uuid
                         """,
                         conversation_id,
                         settled_end,
                     )
+                return created, settled_end
 
-        # Vector indexing outside the lock transaction; failures leave rows
-        # rebuildable from PostgreSQL and never abort the pass.
-        for start_seq, unit_rows in settled_units:
-            row_chunk_id = await self._pool.fetchval(
-                """
-                SELECT id FROM conversation_chunks
-                WHERE conversation_id = $1::uuid AND start_seq = $2
-                """,
-                conversation_id,
-                start_seq,
-            )
-            if row_chunk_id is not None:
-                await self._embed_and_upsert_for_rows(
-                    str(row_chunk_id), conversation_id, start_seq, unit_rows
-                )
-        logger.info(
-            "indexing_pass_completed",
-            extra={"conversation_id": conversation_id, "chunks": created},
+    async def _index_pending_chunks(self, conversation_id: str) -> int:
+        """Embed + upsert every chunk still pending; mark after success.
+
+        Embedding failure skips Qdrant entirely; either failure leaves
+        vector_indexed_at NULL so the next pass retries (M3 final review §7-9).
+        """
+        rows = await self._pool.fetch(
+            """
+            SELECT id, raw_content, start_seq FROM conversation_chunks
+            WHERE conversation_id = $1::uuid AND vector_indexed_at IS NULL
+            ORDER BY start_seq
+            LIMIT 100
+            """,
+            conversation_id,
         )
-        return created
+        indexed = 0
+        for row in rows:
+            if await self._index_chunk(
+                conversation_id, str(row["id"]), row["raw_content"], row["start_seq"]
+            ):
+                indexed += 1
+        return indexed
+
+    async def _index_chunk(
+        self,
+        conversation_id: str,
+        chunk_id: str,
+        raw_content: str,
+        start_seq: int | None = None,
+    ) -> bool:
+        """Embed+upsert one chunk; marks vector_indexed_at only after success."""
+        vector = await self._safe_embed(raw_content)
+        if vector is None:
+            return False  # embedding failed: Qdrant not called, stays pending
+        try:
+            await self._qdrant.upsert(
+                [
+                    {
+                        "id": chunk_id,
+                        "vector": vector,
+                        "payload": {
+                            "conversation_id": conversation_id,
+                            "kind": "chunk",
+                            "chunk_id": chunk_id,
+                            "start_seq": start_seq,
+                        },
+                    }
+                ],
+                vector_size=len(vector),
+            )
+        except Exception as exc:  # noqa: BLE001 - stays retryable (§8)
+            logger.warning(
+                "vector_index_unavailable", extra={"chunk_id": chunk_id, "error": str(exc)}
+            )
+            return False
+        await self._pool.execute(
+            """
+            UPDATE conversation_chunks SET vector_indexed_at = now()
+            WHERE id = $1::uuid AND vector_indexed_at IS NULL
+            """,
+            uuid.UUID(chunk_id),
+        )
+        return True
 
     async def _insert_chunk(
         self,
@@ -185,26 +252,6 @@ class MemoryService:
             message_ids,
             raw_content,
             token_count,
-        )
-
-    async def _embed_and_upsert_for_rows(
-        self,
-        chunk_id: str,
-        conversation_id: str,
-        start_seq: int,
-        unit_rows: list[asyncpg.Record],
-    ) -> None:
-        messages = [json.loads(r["content"]) for r in unit_rows]
-        raw_content = "\n".join(json.dumps(m, ensure_ascii=False) for m in messages)
-        await self._embed_and_upsert(
-            point_id=chunk_id,
-            text=raw_content,
-            payload={
-                "conversation_id": conversation_id,
-                "kind": "chunk",
-                "chunk_id": chunk_id,
-                "start_seq": start_seq,
-            },
         )
 
     # ---------------------------------------------------------------- memories

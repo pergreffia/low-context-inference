@@ -44,6 +44,7 @@ def test_migrations_idempotent_and_schema_present():
         "0003_message_metadata.sql",
         "0004_memory_foundations.sql",
         "0005_index_watermark.sql",
+        "0006_vector_state.sql",
     } <= applied | set(first)
     assert second == []  # never reapplied within a single process
     expected = {
@@ -213,6 +214,7 @@ def test_concurrent_startup_applies_each_exactly_once():
                 "0003_message_metadata.sql",
                 "0004_memory_foundations.sql",
                 "0005_index_watermark.sql",
+                "0006_vector_state.sql",
             }
             # every migration applied exactly once across both runners
             assert len(names) == len(set(names))
@@ -258,14 +260,14 @@ def test_migrations_from_clean_database_create_full_m3_schema():
                 await pool.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
 
             completed = await apply_migrations(pool)
-            assert len(completed) == 5
+            assert len(completed) == 6
 
             cols = await pool.fetch(
                 """
                 SELECT table_name, column_name FROM information_schema.columns
                 WHERE table_schema = 'public'
                   AND column_name IN (
-                      'start_seq', 'ts', 'last_indexed_seq',
+                      'start_seq', 'ts', 'last_chunked_seq',
                       'supersedes', 'superseded_by'
                   )
                 """
@@ -274,7 +276,7 @@ def test_migrations_from_clean_database_create_full_m3_schema():
             assert ("conversation_chunks", "start_seq") in have
             assert ("conversation_chunks", "ts") in have
             assert ("memory_records", "ts") in have
-            assert ("conversations", "last_indexed_seq") in have
+            assert ("conversations", "last_chunked_seq") in have
             assert ("memory_records", "supersedes") in have
             assert ("memory_records", "superseded_by") in have
 
@@ -295,6 +297,15 @@ def test_migrations_from_clean_database_create_full_m3_schema():
             )
             gin_names = {r["indexname"] for r in gin}
             assert {"idx_chunks_ts", "idx_memory_ts"} <= gin_names
+
+            # vector-indexing state column exists on chunks (M3.1)
+            vec_col = await pool.fetchval(
+                """
+                SELECT count(*) FROM information_schema.columns
+                WHERE table_name='conversation_chunks' AND column_name='vector_indexed_at'
+                """
+            )
+            assert vec_col == 1
         finally:
             await pool.close()
 

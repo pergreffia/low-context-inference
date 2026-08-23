@@ -1,449 +1,406 @@
-# MASTER PROMPT — Context Proxy
+# LOW CONTEXT INFERENCE — MASTER PROMPT
 
-## 0. Mission
+## 0. Role
 
-Implement a production-quality, model-agnostic **Context Management Proxy** that exposes an OpenAI-compatible API to clients such as OpenCode.
+You are the primary coding agent for **Low Context Inference**, an OpenAI-compatible context proxy designed to sit between coding agents/clients such as OpenCode and LLM providers.
 
-The proxy must allow conversations substantially larger than the context window of the downstream inference model by:
+Your job is to implement the project milestone by milestone, preserving architectural invariants, compatibility, testability, and production correctness.
 
-- keeping the complete raw conversation locally;
-- maintaining a protected recent-context window;
-- extracting durable memories and decisions;
-- storing historical chunks in a hybrid lexical/vector memory system;
-- retrieving only context relevant to the current request;
-- compacting archived history in batches;
-- dynamically building a context that never exceeds the configured model budget;
-- independently configuring the inference, compact, and embedding endpoints.
+The project is **not a toy MVP**. Prefer explicit domain models, durable persistence, transactional semantics, deterministic algorithms, strong automatic tests, and clean component boundaries.
 
-The system must work transparently with OpenCode.
-
-The client must not need to know that a context-management layer exists.
+Do not implement future milestones early unless explicitly requested.
 
 ---
 
-# 1. Core Design Principle
+# 1. Product Goal
 
-The most important invariant of the entire system is:
+Low Context Inference sits between an AI client and an LLM provider:
 
-> **Loss of context exposure must never imply loss of information.**
+```text
+OpenCode / Agent / OpenAI-compatible client
+                |
+                v
+       Low Context Inference
+                |
+        +-------+-------+
+        |               |
+        v               v
+ conversation       memory/context
+ persistence        orchestration
+        |               |
+        +-------+-------+
+                |
+                v
+          LLM provider
+```
 
-The raw conversation is the source of truth.
+The proxy must remain as transparent as possible at the transport/API boundary while progressively adding:
 
-Compaction, summaries, embeddings, extracted memories, rankings, and pinned state are derived data.
+- durable conversation persistence;
+- context management;
+- memory;
+- retrieval;
+- advanced context optimization;
+- operational hardening;
+- multimodal support.
 
-Never destroy raw conversation data because it has been compacted.
+The system must never silently corrupt, reorder, duplicate, or discard conversation state.
 
 ---
 
-# 2. Non-Goals
+# 2. Core Architectural Principles
 
-Do NOT turn this project into:
+## 2.1 PostgreSQL is authoritative
 
-- an agent framework;
-- a replacement for OpenCode;
-- a generic orchestration platform;
-- a distributed system;
-- a multi-user SaaS;
-- a workflow engine;
-- a Redis-based architecture without a demonstrated need.
+PostgreSQL is the source of truth for:
 
-The system is primarily a **local context-management infrastructure**.
+- conversations;
+- messages;
+- memory records;
+- memory status/supersession;
+- chunks;
+- indexing state;
+- configuration/state that must survive process restart.
 
----
+Qdrant is a **derived, rebuildable semantic index**.
 
-# 3. High-Level Architecture
+Never treat Qdrant as authoritative over PostgreSQL.
 
-```text
-                         OpenCode
-                            │
-                            │ OpenAI-compatible API
-                            ▼
-                 ┌────────────────────┐
-                 │   Context Proxy    │
-                 │                    │
-                 │ OpenAI-compatible  │
-                 └─────────┬──────────┘
-                           │
-              ┌────────────┼─────────────┐
-              │            │             │
-              ▼            ▼             ▼
-       Conversation      Memory       Providers
-          Store          Service
-              │            │        ┌──────┴──────┐
-              │            │        │             │
-              │            ▼     Compact       Embedding
-              │          Qdrant   Endpoint       Endpoint
-              │
-              ▼
-          PostgreSQL
-```
-
-Inference is external to the core Context Proxy:
-
-```text
-Context Proxy ───────────────► Inference Endpoint
-```
-
-The inference endpoint may be:
-
-- Claude;
-- GPT;
-- Bonsai;
-- llama.cpp;
-- Ollama;
-- another OpenAI-compatible service.
-
-The compact endpoint may be a completely different model.
-
-The embedding endpoint may be a third model/service.
+If PostgreSQL says a memory is superseded/inactive, a stale Qdrant hit must not be returned.
 
 ---
 
-# 4. Provider Independence
+## 2.2 Raw conversation is source of truth
 
-The Context Proxy MUST NOT be coupled to a specific LLM provider.
+Never replace raw conversation data with derived representations.
 
-Define abstractions/interfaces for:
+Derived artifacts may include:
 
-```text
-ConversationStore
-MemoryStore
-VectorStore
-EmbeddingProvider
-LLMProvider
-CompactProvider
-```
+- chunks;
+- summaries;
+- memory records;
+- captions;
+- embeddings;
+- retrieval metadata.
 
-Reference implementations:
-
-```text
-PostgresConversationStore
-QdrantVectorStore
-OpenAICompatibleEmbeddingProvider
-OpenAICompatibleLLMProvider
-OpenAICompatibleCompactProvider
-```
-
-All provider implementations must be replaceable through configuration.
+They must always be reconstructable from authoritative data.
 
 ---
 
-# 5. Deployment Architecture
+## 2.3 Conversation isolation is mandatory
 
-Provide a Docker Compose deployment with these services:
+Data belonging to conversation A must never affect conversation B.
 
-```text
-context-proxy
-memory-service
-postgres
-qdrant
-embedding-service
-compact-service
-```
+This applies to:
 
-The embedding and compact services may initially wrap external/local OpenAI-compatible endpoints rather than hosting the models themselves.
+- messages;
+- memories;
+- supersession;
+- chunks;
+- lexical retrieval;
+- semantic retrieval;
+- context assembly;
+- multimodal data.
 
-The architecture must allow replacing them later.
-
-Do not add Redis, Kafka, Elasticsearch, or other infrastructure unless a concrete requirement is demonstrated.
-
-All services must provide:
-
-- health checks;
-- configurable ports;
-- restart policies where appropriate;
-- persistent volumes for stateful services;
-- structured logging.
+Every query and mutation must be explicitly conversation-scoped where applicable.
 
 ---
 
-# 6. Context Proxy
+## 2.4 Determinism
 
-The Context Proxy is the public-facing service.
+Where multiple valid candidates have equal priority, selection must be deterministic.
 
-It must expose at minimum:
+Use explicit tie-breakers such as stable IDs.
+
+Avoid behavior depending accidentally on:
+
+- database row order;
+- hash order;
+- Qdrant result order;
+- async scheduling.
+
+---
+
+## 2.5 Degraded operation
+
+Derived services must not unnecessarily become single points of failure.
+
+Examples:
 
 ```text
-GET  /v1/models
-POST /v1/chat/completions
+Qdrant unavailable
+    -> lexical retrieval can still work
+
+embedding provider unavailable
+    -> lexical retrieval can still work
+
+memory indexing unavailable
+    -> raw conversation persistence and inference can still work
 ```
 
-The API must be OpenAI-compatible.
+Never silently report derived work as successful when it failed.
 
-Support:
+---
 
-- streaming;
-- non-streaming;
-- system messages;
-- user messages;
-- assistant messages;
+## 2.6 No unnecessary infrastructure
+
+Do not introduce Redis, Kafka, Celery, distributed queues, etc. unless a milestone explicitly requires durable asynchronous infrastructure.
+
+Prefer simple, robust mechanisms first.
+
+---
+
+# 3. OpenAI Compatibility
+
+The external API should remain OpenAI-compatible wherever practical.
+
+Preserve:
+
+- request semantics;
+- response semantics;
+- SSE streaming;
+- headers;
+- errors;
 - tool calls;
-- tool results;
-- function calling;
-- finish_reason;
-- usage;
-- model selection;
-- OpenAI-compatible errors.
+- usage metadata;
+- model metadata.
 
-The proxy may transform the input `messages` used for inference.
+Do not rewrite or normalize upstream data unnecessarily.
 
-It must NOT semantically rewrite or reinterpret the inference response.
-
-Streaming responses must be passed through as directly as possible.
-
----
-
-# 7. Conversation Store
-
-PostgreSQL is the reference source of truth.
-
-At minimum persist:
+For streaming:
 
 ```text
-conversations
-messages
-tool_calls
-tool_results
-conversation_chunks
-memory_records
-summaries
+upstream bytes
+      |
+      v
+client
 ```
 
-The raw message content must remain available.
+must remain opaque unless a specific internal feature requires semantic inspection.
 
-Each message must have a stable identifier.
-
-The system must support reconstructing the original conversation from persisted records.
+Internal capture must never corrupt SSE passthrough.
 
 ---
 
-# 8. Conversation Model
+# 4. Conversation Identity
 
-A conversation contains ordered messages.
-
-Messages may be:
+Conversation identity precedence:
 
 ```text
-system
+body conversation_id
+        >
+X-Conversation-ID
+        >
+configured client/session identity header
+        >
+generated UUID
+```
+
+The client/session header is configurable.
+
+Stable client identity must deterministically map to a conversation.
+
+No stable identity means a new generated conversation rather than accidental cross-request continuity.
+
+Explicit conversation IDs must be validated.
+
+---
+
+# 5. Full-History Persistence
+
+Clients may send the complete conversation history on every request.
+
+Example:
+
+```text
+request 1:
+[A]
+
+request 2:
+[A,B,C]
+
+request 3:
+[A,B,C,D]
+```
+
+Persistence must append only the new suffix.
+
+Never globally deduplicate by content: identical messages can legitimately occur multiple times.
+
+---
+
+## 5.1 Divergent history
+
+If:
+
+```text
+persisted:
+[A,B,C]
+
+incoming:
+[A,B,X]
+```
+
+detect divergence.
+
+Before inference:
+
+```text
+HTTP 409
+history_conflict
+no persistence mutation
+no inference call
+```
+
+Never silently merge divergent histories.
+
+---
+
+## 5.2 Atomic reconciliation
+
+For a single conversation:
+
+```text
+BEGIN
+    SELECT conversation FOR UPDATE
+    read history
+    compare
+    calculate suffix
+    append suffix
+COMMIT
+```
+
+The lock must cover both comparison and insertion.
+
+Do not rely on an application-level asyncio lock for correctness.
+
+---
+
+# 6. Concurrent Assistant Semantics
+
+Do not hold a PostgreSQL conversation lock during LLM inference.
+
+Correct architecture:
+
+```text
+lock
+ -> inbound reconciliation
+ -> unlock
+
+inference
+
+lock
+ -> assistant reconciliation
+ -> unlock
+```
+
+If two concurrent inferences produce:
+
+```text
+X
+Y
+```
+
+only one continuation may become the conversation source of truth.
+
+Never create:
+
+```text
+[X,Y]
+```
+
+or:
+
+```text
+[Y,X]
+```
+
+The losing assistant response is still returned to its client because inference has already completed.
+
+Its persistence is best-effort.
+
+Log:
+
+```text
+assistant_persistence_conflict
+```
+
+for expected concurrency conflicts.
+
+Unexpected persistence failures log:
+
+```text
+assistant_persistence_failed
+```
+
+Do not conflate the two.
+
+The same semantics apply to streaming.
+
+---
+
+# 7. Interaction Units
+
+Context trimming and planning must operate on logical interaction units, not arbitrary messages.
+
+A normal unit:
+
+```text
 user
 assistant
-tool
 ```
 
-Tool calls must retain:
-
-- tool call ID;
-- tool name;
-- arguments;
-- associated assistant message;
-- tool result;
-- timestamps.
-
-Never flatten structured tool calls into plain text as the only representation.
-
----
-
-# 9. Conversation Chunks
-
-Do not create an embedding for every individual message.
-
-Group messages into semantic conversation chunks.
-
-A chunk may contain:
+A tool unit:
 
 ```text
-user request
-assistant response
-tool call
-tool result
-assistant interpretation
+user
+assistant(tool_call)
+tool(result)
+assistant(final)
 ```
 
-Do not separate a tool call from its corresponding result when they belong to the same interaction.
+must remain atomic.
 
-Each chunk must contain:
+Never select:
 
-```text
-chunk_id
-conversation_id
-message_ids
-raw_content
-summary
-token_count
-importance
-created_at
-embedding reference
-```
+- assistant without its user;
+- tool result without its tool call;
+- tool call without its owning assistant;
+- an incomplete logical interaction.
 
-The raw chunk remains recoverable.
+The current request must always be preserved if it can fit within the effective budget.
 
 ---
 
-# 10. Memory Record
+# 8. Streaming Capture
 
-Use the following logical structure:
+Capture semantic state without changing transport.
 
-```text
-MemoryRecord
-├── id
-├── conversation_id
-├── kind
-├── content
-├── source_message_ids
-├── created_at
-├── importance
-├── status
-├── supersedes
-├── superseded_by
-├── embedding_id
-└── metadata
-```
+Preserve where supported:
 
-Supported `kind` values:
+- role;
+- accumulated content;
+- tool_calls;
+- refusal;
+- finish_reason;
+- usage;
+- model.
 
-```text
-decision
-constraint
-fact
-task
-bug
-implementation
-tool_result
-episode_summary
-conversation_summary
-```
+SSE framing remains opaque to the downstream client.
 
-Supported `status` values:
+For streaming persistence:
 
-```text
-active
-superseded
-resolved
-obsolete
-```
-
-Do not delete obsolete/superseded records from the source-of-truth database.
-
-They must simply be excluded from active retrieval.
+- complete stream reaches client even if persistence fails;
+- expected divergence logs `assistant_persistence_conflict`;
+- unexpected failure logs `assistant_persistence_failed`;
+- persistence failure never triggers inference retry;
+- persistence failure never corrupts the stream.
 
 ---
 
-# 11. Source Traceability
+# 9. Context Budgeting Foundation
 
-Every derived memory must contain references to its source messages.
-
-Example:
-
-```json
-{
-  "id": "memory-381",
-  "kind": "decision",
-  "content": "The domain layer must not depend on GitHub adapters.",
-  "source_message_ids": [
-    "msg-184",
-    "msg-185",
-    "msg-186"
-  ],
-  "status": "active"
-}
-```
-
-This allows the system to retrieve the original conversation when required.
-
-Never make a summary the only representation of an important fact.
-
----
-
-# 12. Decision Supersession
-
-Decisions must support supersession.
-
-Example:
-
-```text
-D001
-"Use SQLite"
-status = superseded
-superseded_by = D014
-
-D014
-"Use PostgreSQL"
-status = active
-```
-
-Before ranking retrieval candidates:
-
-1. remove obsolete records;
-2. remove superseded records;
-3. retain only the currently active decision.
-
-A historical decision must never be injected into the final context as if it were still active.
-
----
-
-# 13. Pinned Memory
-
-The system must support a special class of high-priority memory called `pinned`.
-
-Pinned information may include:
-
-- active architectural decisions;
-- explicit constraints;
-- durable requirements;
-- current project goal;
-- critical project state.
-
-Pinned memory is always a candidate for the final context.
-
-It is subject to a configurable token budget.
-
-Example:
-
-```yaml
-context:
-  pinned_budget_tokens: 2000
-```
-
-If pinned memory exceeds its budget, lower-priority records must be demoted to normal retrieval rather than arbitrarily truncating critical records.
-
----
-
-# 14. Recent Window
-
-The recent conversation window is protected.
-
-Example configuration:
-
-```yaml
-context:
-  recent_target_tokens: 14000
-  recent_min_tokens: 10000
-  recent_max_tokens: 18000
-```
-
-Recent messages must remain raw.
-
-Do not compact the recent window during normal operation.
-
-Tool calls and tool results must remain logically associated.
-
-Do not split an interaction arbitrarily.
-
----
-
-# 15. Context Budget
-
-Never use the theoretical model context limit directly.
-
-Configuration:
-
-```yaml
-context:
-  model_limit_tokens: 32768
-  safety_margin_tokens: 2048
-```
-
-Effective usable budget:
+The effective budget is:
 
 ```text
 usable_budget =
@@ -451,926 +408,898 @@ usable_budget =
     - safety_margin_tokens
 ```
 
-For a 32k model:
+The final context must never exceed the usable budget.
 
-```text
-32768 - 2048 = 30720
-```
+Account for:
 
-The budget manager must dynamically allocate this budget.
+- system messages;
+- tool definitions;
+- pinned context;
+- recent interaction units;
+- historical context;
+- retrieved memory;
+- current request.
 
-Example:
+The current request must not be silently dropped.
 
-```text
-system/tools        4k
-pinned              2k
-recent             14k
-retrieved           7k
-current request     2k
------------------------
-                    29k
-```
+If the current request alone cannot fit, return an OpenAI-compatible context-length error before inference.
 
-If tool definitions grow, retrieval must shrink.
-
-Do not exceed the effective budget.
+M2 uses a deterministic model-agnostic token heuristic. Do not pretend it is an exact model tokenizer.
 
 ---
 
-# 16. Context Priority
+# 10. M3 — Memory and Retrieval
 
-When the budget is insufficient, use this priority order:
+M3 introduces:
 
-```text
-1. system prompt
-2. tool definitions
-3. current user request
-4. recent conversation
-5. active pinned state
-6. retrieved relevant raw context
-7. retrieved historical summaries
-8. generic historical summary
-```
-
-Never sacrifice the current user request.
-
-Never silently exceed the model budget.
+- memory records;
+- memory kinds/types;
+- supersession;
+- turn chunking;
+- PostgreSQL lexical retrieval;
+- Qdrant semantic retrieval;
+- hybrid retrieval;
+- memory indexing;
+- internal memory APIs.
 
 ---
 
-# 17. Historical Retrieval
+## 10.1 Memory supersession
 
-Historical retrieval must be hybrid.
+A memory may supersede another memory only within the same conversation.
 
-Do NOT rely exclusively on embeddings.
-
-The retrieval pipeline must conceptually be:
+Required invariant:
 
 ```text
-Current request
-      │
-      ├── semantic/vector search
-      │
-      └── lexical search
-              │
-              ▼
-        candidate fusion
-              │
-              ▼
-      metadata filtering
-              │
-              ▼
-      supersession filtering
-              │
-              ▼
-           ranking
-              │
-              ▼
-       diversity/MMR
-              │
-              ▼
-       budget selection
+new_memory.conversation_id
+==
+target_memory.conversation_id
+```
+
+Check this transactionally.
+
+Never allow cross-conversation supersession.
+
+---
+
+## 10.2 Turn chunking
+
+Completed interaction units can become chunks.
+
+Trailing/live turns must remain outside completed chunk storage.
+
+Tool calls/results must remain in the same logical chunk.
+
+Chunk creation is idempotent.
+
+Use a uniqueness constraint such as:
+
+```text
+UNIQUE(conversation_id, start_seq)
 ```
 
 ---
 
-# 18. Retrieval Metadata
+## 10.3 Retrieval architecture
 
-Retrieval candidates should support filtering by:
+Use:
 
 ```text
-conversation_id
-kind
-status
-importance
-created_at
-source
+PostgreSQL
+    -> lexical retrieval / authoritative metadata
+
+Qdrant
+    -> semantic retrieval / derived index
 ```
 
-At minimum, retrieval must be restricted to the relevant conversation/session unless explicit cross-conversation memory is implemented.
+Hybrid retrieval may combine:
 
-Do not leak memories between unrelated conversations.
+- semantic score;
+- lexical score;
+- recency;
+- importance;
+- memory type.
+
+PostgreSQL must revalidate semantic hits before returning them.
+
+Superseded/inactive memories must not be returned even if Qdrant is stale.
 
 ---
 
-# 19. Retrieval Ranking
+## 10.4 Degraded retrieval
 
-Initial configurable score:
+If semantic retrieval fails:
 
 ```text
-score =
-    0.40 * semantic_similarity
-  + 0.25 * lexical_score
-  + 0.15 * recency
-  + 0.15 * importance
-  + 0.05 * type_priority
+semantic unavailable
+        ↓
+lexical retrieval
 ```
 
-Weights must be configurable.
+The request should continue where possible.
 
-The ranking implementation must be deterministic for equal inputs where practical.
+Likewise Qdrant failure must not make lexical retrieval unavailable.
 
 ---
 
-# 20. Retrieval Diversity
+## 10.5 Durable vector indexing
 
-Avoid returning many nearly identical chunks.
+Chunking progress and vector-indexing progress are separate concepts.
 
-Example bad result:
-
-```text
-chunk-181
-chunk-182
-chunk-183
-chunk-184
-```
-
-when all describe the same event.
-
-Prefer diverse evidence:
+The conversation watermark represents:
 
 ```text
-old decision
-old bug
-test failure
-implementation
-tool result
+last_chunked_seq
 ```
 
-Implement MMR or an equivalent diversity-aware selection algorithm.
+not confirmed vector indexing.
+
+Each chunk must have explicit vector-indexing state, preferably:
+
+```text
+vector_indexed_at NULL
+```
+
+until:
+
+```text
+embedding succeeds
+AND
+Qdrant upsert succeeds
+```
+
+If embedding/Qdrant/timeout fails:
+
+```text
+vector_indexed_at remains NULL
+```
+
+and the chunk is retried on a future indexing pass.
+
+Process restart must recover pending chunks using PostgreSQL state.
+
+Do not rely on in-memory queues as the source of truth.
 
 ---
 
-# 21. Raw vs Summary Retrieval
+# 11. M4 — Advanced Context & Memory Optimization
 
-A historical chunk may have both:
+**M4 is the next milestone.**
 
-```text
-raw content
-summary
-```
+M4 is the intelligence layer that decides what context should actually be sent to the model.
 
-If enough budget is available:
+Do not merely add another retrieval feature.
 
-```text
-retrieve raw
-```
-
-If budget is constrained:
-
-```text
-retrieve summary
-```
-
-This should be automatic.
-
-Raw content has higher information fidelity.
-
-Summary has lower token cost.
-
----
-
-# 22. Retrieval Confidence
-
-The system should support a minimum retrieval confidence threshold.
-
-If retrieval produces only weak candidates, it is safer to inject less historical context than to inject irrelevant or contradictory information.
-
-Do not fill the context budget merely because free tokens are available.
-
-Relevance is more important than utilization.
-
----
-
-# 23. Compaction
-
-Compaction must NOT happen on every request.
-
-Use configurable thresholds:
-
-```yaml
-compaction:
-  trigger_ratio: 0.85
-  target_ratio: 0.60
-  min_archive_tokens: 10000
-```
-
-For a 32k context:
-
-```text
-trigger ≈ 27k
-target  ≈ 19k
-```
-
-The purpose is to create significant headroom, not save a few tokens.
-
----
-
-# 24. Compaction Strategy
-
-Compaction must operate on archived history, not the protected recent window.
+Build a dedicated **Context Assembly Engine**.
 
 Conceptually:
 
 ```text
-RAW HISTORY
-│
-├── protected recent window
-│
-└── archived history
-      │
-      ├── chunks
-      ├── memories
-      └── summaries
-```
-
-When sufficient archived material accumulates:
-
-```text
-archived chunks
-      │
-      ▼
-compact endpoint
-      │
-      ▼
-structured compact state
-```
-
-Do not compact only the oldest few tokens every time the threshold is crossed.
-
-Compaction should be batch-oriented.
-
----
-
-# 25. Compaction Batch
-
-Example:
-
-```text
-archive:
-    4k
-    4k
-    4k
-
-total archived:
-    12k
-```
-
-Only then invoke the compact endpoint.
-
-Target:
-
-```text
-12k raw
-   ↓
-~1-2k structured state
-```
-
-The exact target is configurable.
-
-The system must prevent pathological behavior where many consecutive requests each trigger a compact.
-
----
-
-# 26. Compaction Output
-
-The compact prompt must explicitly request structured state.
-
-Conceptual output:
-
-```json
-{
-  "decisions": [],
-  "constraints": [],
-  "facts": [],
-  "open_tasks": [],
-  "bugs": [],
-  "implementations": [],
-  "important_files": [],
-  "obsolete_decisions": []
-}
-```
-
-The compact model must be instructed:
-
-- do not invent information;
-- preserve exact identifiers;
-- preserve file names;
-- preserve class/function names;
-- preserve important error messages;
-- preserve active constraints;
-- identify obsolete decisions;
-- preserve unresolved problems;
-- preserve important implementation details;
-- retain source message references where possible.
-
-Compact output must be token-budgeted.
-
-Default:
-
-```yaml
-compact:
-  max_output_tokens: 2048
+conversation
+      |
+      +-- recent context
+      |
+      +-- raw history
+      |
+      +-- memories
+      |
+      +-- retrieved candidates
+      |
+      v
+candidate fusion
+      |
+      v
+deduplication
+      |
+      v
+supersession filtering
+      |
+      v
+relevance scoring
+      |
+      v
+MMR / diversity
+      |
+      v
+budget allocation
+      |
+      v
+context packing
+      |
+      v
+ContextPlan
+      |
+      v
+final model request
 ```
 
 ---
 
-# 27. Compact Provider
+## 11.1 Context Assembly Engine
 
-Compact endpoint must be independently configurable from inference.
+Introduce a dedicated domain component with a clear API, conceptually:
 
-Example:
-
-```yaml
-compact:
-  base_url: http://localhost:8001/v1
-  api_key: local
-  model: bonsai
-  max_output_tokens: 2048
+```python
+context = context_engine.build(
+    conversation=...,
+    memories=...,
+    candidates=...,
+    constraints=...
+)
 ```
 
-Inference may simultaneously be:
+It should return a structured plan, conceptually:
 
-```yaml
-inference:
-  base_url: https://provider.example/v1
-  api_key: ${API_KEY}
-  model: strong-model
+```text
+ContextPlan
+    selected_items
+    dropped_items
+    token_estimate
+    budget
+    rationale
+    diagnostics
 ```
 
-This configuration must work without code changes.
+Do not scatter context assembly logic across API routes.
 
 ---
 
-# 28. Embedding Provider
+## 11.2 Candidate fusion
 
-Embedding endpoint must also be independent.
+Inputs may include:
 
-Example:
+- recent conversation;
+- pinned context;
+- retrieved memories;
+- raw historical chunks;
+- summaries when available;
+- tool-related context.
 
-```yaml
-embeddings:
-  base_url: http://localhost:8002/v1
-  api_key: local
-  model: local-embedding-model
-```
-
-The memory system must not depend on the embedding model implementation.
+Every candidate must carry enough metadata for deterministic selection.
 
 ---
 
-# 29. Conversation Lifecycle
+## 11.3 Deduplication
 
-For every request:
+The same semantic information may appear in:
 
-```text
-1. receive request
-2. identify conversation
-3. persist raw incoming messages
-4. update recent window
-5. archive messages when required
-6. create/update conversation chunks
-7. update retrieval index
-8. check compaction conditions
-9. compact archive if required
-10. calculate context budget
-11. retrieve relevant historical context
-12. select final context
-13. validate token budget
-14. send inference request
-15. stream/pass-through response
-16. persist raw assistant response
-17. update memory metadata
-```
+- recent history;
+- memory records;
+- retrieved chunks.
 
-Do not reorder these steps unless required by correctness.
+Deduplicate without deleting authoritative raw conversation state.
+
+Deduplication affects only the assembled context.
 
 ---
 
-# 30. Response Handling
+## 11.4 Supersession
 
-Inference responses must be treated as opaque protocol data wherever possible.
+Superseded memories must be removed before final selection.
 
-For streaming:
-
-```text
-Inference
-   │
-   │ SSE chunks
-   ▼
-Context Proxy
-   │
-   │ unchanged/pass-through
-   ▼
-OpenCode
-```
-
-Do not aggregate the entire response unnecessarily.
-
-Do not rewrite tool calls.
-
-Do not convert structured responses into text.
+Do not allow a stale memory to survive simply because it scored highly.
 
 ---
 
-# 31. Failure Handling
+## 11.5 Relevance scoring
 
-The system must degrade gracefully.
+M4 should make scoring explicit and testable.
 
-### Vector database unavailable
+Consider:
 
-Fallback to:
+- semantic relevance;
+- lexical relevance;
+- recency decay;
+- importance;
+- memory type;
+- source;
+- redundancy;
+- query/context relationship.
 
-```text
-recent + pinned + summary
-```
+Weights must be configurable.
 
-### Embedding service unavailable
-
-Continue using lexical retrieval where possible.
-
-### Compact service unavailable
-
-Do not block requests if a valid working context can still be constructed.
-
-### Memory service unavailable
-
-Fallback to:
-
-```text
-recent raw + pinned
-```
-
-### Inference endpoint unavailable
-
-Return a valid OpenAI-compatible error.
-
-### Context overflow
-
-Never send an over-budget request.
-
-The proxy must detect this before forwarding.
+Scoring must be deterministic.
 
 ---
 
-# 32. Persistence and Rebuild
+## 11.6 MMR / diversity
 
-Qdrant must be treated as a derived index.
+Implement diversity-aware selection.
 
-There must be a mechanism to rebuild vector indexes from PostgreSQL.
-
-The system must remain recoverable if:
+Goal:
 
 ```text
-Qdrant data is lost
+high relevance
++
+low redundancy
 ```
 
-PostgreSQL must contain sufficient information to reconstruct derived memory/index state.
+Do not simply select the top N highest scores.
 
----
-
-# 33. API Contracts Between Services
-
-Define explicit internal APIs.
-
-At minimum:
-
-```text
-Context Proxy → Memory Service
-    store message
-    store chunk
-    retrieve memories
-    retrieve raw chunks
-    create memory
-    supersede memory
-
-Context Proxy → Compact Service
-    compact archive
-
-Memory Service → Embedding Service
-    create embeddings
-```
-
-Use typed request/response schemas.
-
-Do not pass arbitrary unvalidated dictionaries between services.
-
-Version internal APIs where appropriate.
-
----
-
-# 34. Configuration
-
-All important behavior must be configurable.
-
-Example:
-
-```yaml
-server:
-  host: 0.0.0.0
-  port: 8080
-
-inference:
-  base_url: ...
-  api_key: ...
-  model: ...
-
-compact:
-  base_url: ...
-  api_key: ...
-  model: ...
-  max_output_tokens: 2048
-
-embeddings:
-  base_url: ...
-  api_key: ...
-  model: ...
-
-context:
-  model_limit_tokens: 32768
-  safety_margin_tokens: 2048
-  pinned_budget_tokens: 2000
-  recent_target_tokens: 14000
-  recent_min_tokens: 10000
-  recent_max_tokens: 18000
-
-retrieval:
-  semantic_weight: 0.40
-  lexical_weight: 0.25
-  recency_weight: 0.15
-  importance_weight: 0.15
-  type_weight: 0.05
-
-compaction:
-  trigger_ratio: 0.85
-  target_ratio: 0.60
-  min_archive_tokens: 10000
-```
-
-Never hardcode model-specific limits in application logic.
-
----
-
-# 35. Observability
-
-Implement structured logging.
-
-Every request should be traceable with a request ID.
-
-Expose metrics/log information for:
-
-- request latency;
-- inference latency;
-- retrieval latency;
-- embedding latency;
-- compact latency;
-- number of retrieved chunks;
-- retrieved tokens;
-- final context tokens;
-- recent tokens;
-- pinned tokens;
-- compact invocations;
-- compact input tokens;
-- compact output tokens;
-- fallback events;
-- provider errors.
-
-Do not log API keys or sensitive credentials.
-
----
-
-# 36. Testing
-
-Implement comprehensive automated tests.
-
-## Context tests
-
-Verify:
-
-- recent window remains raw;
-- tool call/result remain associated;
-- context never exceeds configured budget;
-- system prompt is preserved;
-- current user request is preserved;
-- retrieval shrinks when budget shrinks.
-
-## Memory tests
-
-Verify:
-
-- source message IDs are correct;
-- superseded decisions are excluded;
-- obsolete memories are excluded;
-- duplicate chunks are deduplicated;
-- diversity selection works.
-
-## Compaction tests
-
-Explicitly test that:
-
-```text
-100 requests
-+ small context increments
-```
-
-do NOT result in:
-
-```text
-100 compact operations
-```
-
-Also verify:
-
-```text
-raw history before compaction
-==
-raw history after compaction
-```
-
-## API tests
+MMR must be deterministic and testable.
 
 Test:
 
-- OpenAI-compatible request;
-- streaming;
-- non-streaming;
-- tool calls;
-- tool results;
-- errors;
-- usage;
-- models endpoint.
-
-## Failure tests
-
-Simulate:
-
-- Qdrant unavailable;
-- PostgreSQL unavailable;
-- embedding service unavailable;
-- compact service unavailable;
-- inference service unavailable.
+- highly similar candidates;
+- diverse candidates;
+- equal scores;
+- empty candidate set;
+- fewer candidates than requested.
 
 ---
 
-# 37. A/B Benchmark
+## 11.7 Token budget allocation
 
-Create a benchmark comparing:
+M4 must allocate the usable context budget across categories.
 
-### Baseline
+At minimum consider:
 
 ```text
-Bonsai + native 32k context
+system
+tool definitions
+pinned context
+current request
+recent turns
+retrieved memories/history
 ```
 
-### Context Proxy
+The current request is mandatory if it fits.
+
+Define explicit priorities when the budget is insufficient.
+
+The final assembled context must never exceed the effective budget.
+
+---
+
+## 11.8 Raw vs derived context
+
+Do not assume that the most relevant memory is always preferable to raw conversation.
+
+Define explicit precedence between:
+
+- current request;
+- recent raw turns;
+- pinned context;
+- memory;
+- historical chunks;
+- summaries.
+
+Document the rationale.
+
+---
+
+## 11.9 Context packing
+
+The packer must preserve interaction atomicity.
+
+Never split:
 
 ```text
-Bonsai + virtual context
+user + assistant
 ```
 
-Use real or representative coding tasks.
+or:
 
-Measure:
+```text
+user + tool call + tool result + assistant
+```
 
-- task success rate;
-- test pass rate;
-- tool-call correctness;
-- regressions;
-- unnecessary edits;
-- latency;
-- retrieval calls;
-- compact calls;
-- inference tokens;
-- compact tokens.
+just to gain a few tokens.
 
-The goal is to verify that virtual context does not significantly degrade coding quality.
+If a complete candidate does not fit, drop the entire logical unit.
 
 ---
 
-# 38. Acceptance Criteria
+## 11.10 Explainability
 
-The project is complete when:
+The planner should produce diagnostics suitable for debugging.
 
-1. OpenCode can use the proxy without functional client-side changes.
-2. The proxy supports streaming and tool calls.
-3. Raw conversation data is never lost.
-4. Final context never exceeds the configured model budget.
-5. Recent messages remain raw.
-6. Superseded decisions are never presented as active.
-7. Retrieval combines semantic and lexical search.
-8. Retrieval applies diversity.
-9. Compaction does not execute on every request.
-10. Compact and inference can use completely different models.
-11. Embeddings can be replaced through configuration.
-12. Qdrant can be rebuilt from PostgreSQL.
-13. The system degrades gracefully when retrieval or compaction is unavailable.
-14. The complete stack runs with Docker Compose.
-15. Automated tests verify context budgeting.
-16. Automated tests verify OpenAI-compatible behavior.
-17. An A/B benchmark exists for native versus virtual context.
-18. No provider-specific logic leaks into the Context Manager core.
-19. No raw history is destroyed by compaction.
-20. The system is usable as a transparent OpenAI-compatible endpoint for OpenCode.
+Example:
+
+```text
+selected:
+  recent_turn_42
+  memory_17
+  chunk_81
+
+dropped:
+  chunk_72 -> redundant
+  memory_12 -> superseded
+  chunk_91 -> budget
+```
+
+Do not expose sensitive internal diagnostics to external clients unless explicitly designed for that purpose.
+
+Provide an internal/debug representation.
 
 ---
 
-# 39. Milestones
+## 11.11 Context preview/debug endpoint
 
-Implement incrementally.
+Consider an internal endpoint or debug API that can show:
 
-## M1 — Foundation
+- candidate list;
+- scores;
+- selected items;
+- dropped items;
+- token estimates;
+- budget;
+- reasons.
 
-Implement:
-
-- repository structure;
-- project configuration;
-- Docker Compose skeleton;
-- provider abstractions;
-- PostgreSQL;
-- basic OpenAI-compatible proxy;
-- inference passthrough;
-- streaming passthrough.
-
-Do not implement memory yet.
-
-All M1 tests must pass before proceeding.
+It must never leak data across conversations.
 
 ---
 
-## M2 — Conversation Management
+## 11.12 M4 testing
 
-Implement:
+M4 requires strong unit + integration coverage.
 
-- conversations;
-- messages;
-- tool calls/results;
-- raw persistence;
-- recent window;
-- token counting;
-- dynamic context budgeting.
+Test at minimum:
 
-Tests must prove the context never exceeds the configured budget.
+- budget never exceeded;
+- current request preserved;
+- tool definitions consume budget;
+- pinned context precedence;
+- recent context precedence;
+- MMR diversity;
+- deterministic tie-breaking;
+- duplicate elimination;
+- supersession;
+- memory vs raw-history precedence;
+- insufficient-budget behavior;
+- empty retrieval;
+- provider/token-counter failures;
+- conversation isolation;
+- context plan reproducibility.
 
----
-
-## M3 — Memory Service
-
-Implement:
-
-- Memory Service;
-- PostgreSQL memory records;
-- Qdrant;
-- embeddings;
-- conversation chunks;
-- hybrid retrieval;
-- metadata filtering;
-- supersession.
-
-All memory data must be traceable back to raw messages.
+Add property/invariant tests where useful.
 
 ---
 
-## M4 — Compaction
+# 12. M5 — Production Hardening / Operations
 
-Implement:
+Former M4 is now M5.
 
-- archive lifecycle;
-- batch compaction;
-- structured compact output;
-- compact provider;
-- memory extraction;
-- decision supersession;
-- summary management.
+Focus:
 
-Explicitly test that compaction does not happen on every request.
-
----
-
-## M5 — Advanced Context Selection
-
-Implement:
-
-- configurable scoring;
-- hybrid ranking;
-- diversity/MMR;
-- raw-vs-summary selection;
-- dynamic budget allocation;
-- retrieval confidence threshold;
-- pinned state.
-
-This milestone is critical to final quality.
-
----
-
-## M6 — Reliability
-
-Implement:
-
-- retries;
-- timeouts;
-- health checks;
-- graceful degradation;
-- provider failure handling;
 - structured logging;
 - metrics;
-- persistence/index rebuild.
+- tracing;
+- latency breakdown;
+- token/cost accounting;
+- health/readiness;
+- circuit breakers;
+- retries/backoff where appropriate;
+- rate limiting;
+- resource limits;
+- configuration validation;
+- graceful shutdown;
+- production Docker configuration;
+- CI/CD;
+- migration safety;
+- Qdrant rebuild/recovery procedures;
+- operational diagnostics;
+- load testing;
+- stress testing;
+- failure injection;
+- security hardening.
+
+M5 must not change core semantic behavior without explicit justification.
 
 ---
 
-## M7 — Validation
+# 13. M6 — Multimodal Context & Memory
 
-Implement:
+M6 adds first-class multimodal support.
 
-- full integration test suite;
-- OpenCode compatibility tests;
-- A/B benchmark;
-- latency measurements;
-- memory usage measurements;
-- token usage measurements;
-- compact frequency measurements.
+The primary initial use case is **screenshots sent by coding agents such as OpenCode**.
 
 ---
 
-# 40. Development Rules
+## 13.1 M6.1 — Multimodal transparency
 
-Follow these rules throughout implementation:
-
-1. Do not skip tests.
-2. Do not silently simplify requirements.
-3. Do not replace Qdrant/PostgreSQL with in-memory mocks in production code.
-4. Mocks are acceptable only in unit tests.
-5. Keep service boundaries explicit.
-6. Keep provider abstractions independent of concrete implementations.
-7. Never destroy raw conversation data.
-8. Never exceed the context budget.
-9. Never silently discard current user input.
-10. Preserve OpenAI-compatible protocol semantics.
-11. Preserve tool-call structure.
-12. Do not introduce unnecessary infrastructure.
-13. Prefer deterministic algorithms where possible.
-14. Make thresholds and ranking weights configurable.
-15. Document non-obvious design decisions.
-16. Add regression tests for every discovered bug.
-17. Keep commits small and logically scoped.
-18. Run the relevant test suite after each milestone.
-19. Do not mark a milestone complete while known test failures remain.
-20. Before implementing a major architectural deviation, document the reason and update the design.
-
----
-
-# 41. Required Deliverables
-
-The implementation must include:
+The proxy must support messages where:
 
 ```text
-README.md
-ARCHITECTURE.md
-CONFIGURATION.md
-API.md
-DEVELOPMENT.md
-docker-compose.yml
-.env.example
+content = string
 ```
 
-The README must explain:
+or:
 
-- architecture;
-- local deployment;
+```text
+content = array of content parts
+```
+
+At minimum preserve:
+
+- `text`;
+- `image_url`;
+- `data:` image URLs where supported.
+
+Unknown content parts should remain opaque rather than being silently discarded.
+
+Example:
+
+```json
+{
+  "role": "user",
+  "content": [
+    {
+      "type": "text",
+      "text": "What is wrong here?"
+    },
+    {
+      "type": "image_url",
+      "image_url": {
+        "url": "data:image/png;base64,..."
+      }
+    }
+  ]
+}
+```
+
+The proxy must preserve the image through:
+
+```text
+client
+ -> persistence
+ -> context selection
+ -> provider
+```
+
+when the selected context contains that interaction.
+
+Do not degrade the image into a string.
+
+---
+
+## 13.2 Multimodal persistence
+
+Raw multimodal content must remain reconstructable.
+
+Do not necessarily store huge base64 blobs directly in PostgreSQL if a durable media reference is more appropriate.
+
+The authoritative conversation must retain enough information to reconstruct the provider request.
+
+Associate media with the logical interaction unit.
+
+---
+
+## 13.3 Multimodal interaction atomicity
+
+An interaction:
+
+```text
+user
+  text
+  image
+
+assistant
+  text
+```
+
+must remain one logical unit.
+
+Context selection cannot keep the text while dropping the image.
+
+If the interaction is selected, its required multimodal parts must remain intact.
+
+---
+
+## 13.4 Multimodal memory
+
+Later M6 work may add:
+
+- vision descriptions;
+- OCR;
+- media metadata;
+- image-derived memories;
+- audio transcripts;
+- video transcripts/keyframes.
+
+Derived representations must never replace the original raw media reference.
+
+---
+
+## 13.5 Multimodal retrieval
+
+Later M6 work may add:
+
+- image embeddings;
+- multimodal embeddings;
+- text → image retrieval;
+- image → image retrieval;
+- text + image → memory retrieval;
+- visual/text score fusion.
+
+Qdrant remains derived.
+
+PostgreSQL remains authoritative.
+
+---
+
+# 14. Milestone Roadmap
+
+Current roadmap:
+
+```text
+M0 — Foundation / Infrastructure
+M1 — OpenAI-compatible Proxy + Provider + Persistence Foundation
+M2 — Conversation Persistence + Context Management
+M3 — Memory + Hybrid Retrieval
+M4 — Advanced Context & Memory Optimization
+M5 — Production Hardening / Observability / Operations
+M6 — Multimodal Context & Memory
+```
+
+Do not move functionality between milestones without explicit instruction.
+
+---
+
+# 15. Testing Philosophy
+
+Every milestone must add automatic tests for new invariants.
+
+Prefer:
+
+- unit tests for pure algorithms;
+- PostgreSQL integration tests for transactions/constraints/FTS;
+- Qdrant integration tests where semantic index behavior matters;
+- API integration tests for OpenAI compatibility;
+- concurrency tests with real PostgreSQL where persistence correctness is involved;
+- failure-injection tests;
+- deterministic property/invariant tests.
+
+Do not rely solely on mocks for concurrency/database guarantees.
+
+A test suite that skips all integration tests because dependencies are unavailable is not sufficient CI validation.
+
+---
+
+# 16. CI Requirements
+
+CI must run:
+
+```bash
+pytest
+ruff check .
+```
+
+and:
+
+```bash
+mypy .
+```
+
+when mypy is configured.
+
+PostgreSQL-backed tests must execute in CI.
+
+Do not allow CI to become green merely because integration tests are skipped.
+
+---
+
+# 17. Resource Lifecycle
+
+Every component that owns an HTTP/database/client resource must have explicit lifecycle semantics.
+
+Distinguish:
+
+```text
+application-owned
+```
+
+from:
+
+```text
+dependency-injected/external-owned
+```
+
+Only owners close resources.
+
+Shutdown must be resilient: one cleanup failure must not prevent other owned resources from being closed.
+
+---
+
+# 18. Error Handling
+
+Errors must be semantically classified.
+
+Do not use broad:
+
+```python
+except Exception:
+    ...
+```
+
+when a known domain error has a distinct meaning.
+
+Examples:
+
+```text
+HistoryDivergenceError
+assistant_persistence_conflict
+assistant_persistence_failed
+```
+
+Expected degraded behavior must be distinguishable from unexpected failure.
+
+Never claim success for derived work that did not actually complete.
+
+---
+
+# 19. Security and Data Boundaries
+
+Never allow:
+
+- cross-conversation retrieval;
+- cross-conversation supersession;
+- cross-conversation context injection;
+- arbitrary provider credentials in logs;
+- raw media leakage across conversations.
+
+Be careful with:
+
+- URLs;
+- data URLs;
+- base64 media;
+- tool arguments;
+- error messages;
+- debug diagnostics.
+
+---
+
+# 20. Scope Discipline
+
+When implementing a milestone:
+
+1. inspect the existing architecture first;
+2. preserve established invariants;
+3. implement only the milestone scope;
+4. add regression tests;
+5. run the full suite;
+6. review migrations;
+7. review concurrency;
+8. review lifecycle;
+9. report limitations honestly.
+
+Do not perform unrelated refactoring.
+
+Do not declare a milestone complete if acceptance criteria are unmet.
+
+---
+
+# 21. Required Code Review Workflow
+
+For each milestone:
+
+### Step 1 — Understand
+
+Inspect:
+
+- current code;
+- migrations;
+- tests;
+- docs;
 - configuration;
-- connecting OpenCode;
-- configuring inference;
-- configuring compact;
-- configuring embeddings;
-- rebuilding Qdrant;
-- running tests.
+- previous milestone invariants.
+
+### Step 2 — Implement
+
+Make the smallest coherent architectural change.
+
+### Step 3 — Test
+
+Add tests for:
+
+- happy path;
+- edge cases;
+- failure paths;
+- concurrency;
+- persistence;
+- API behavior.
+
+### Step 4 — Validate
+
+Run:
+
+```bash
+pytest
+ruff check .
+```
+
+and configured static checks.
+
+### Step 5 — Review
+
+Before declaring completion, explicitly inspect:
+
+- data integrity;
+- conversation isolation;
+- transaction boundaries;
+- race conditions;
+- resource lifecycle;
+- failure recovery;
+- test coverage;
+- migration safety;
+- scope violations.
+
+### Step 6 — Report
+
+Report:
+
+1. files changed;
+2. architecture changes;
+3. tests added;
+4. validation results;
+5. known limitations;
+6. remaining technical debt;
+7. milestone acceptance status.
 
 ---
 
-# 42. Final Engineering Principle
+# 22. Current Task
 
-The Context Proxy is not attempting to make the underlying LLM's context window physically larger.
+**Resume development from M4.**
 
-It creates a **virtual context layer**:
+Do not reimplement M0–M3.
+
+First inspect the current repository state and verify that M3 is complete according to its acceptance criteria.
+
+Then implement **M4 — Advanced Context & Memory Optimization** as specified above.
+
+Before coding:
+
+1. inspect the existing M2 context planner/budgeting implementation;
+2. inspect M3 retrieval/memory interfaces;
+3. identify existing abstractions that can become the Context Assembly Engine;
+4. avoid duplicating token budgeting/retrieval logic;
+5. define the M4 domain contracts before integrating them into the request path.
+
+M4 should culminate in a deterministic, testable:
 
 ```text
-                 Virtual Context
-                       │
-       ┌───────────────┼────────────────┐
-       │               │                │
-   recent raw      pinned state    historical retrieval
-       │               │                │
-       └───────────────┼────────────────┘
-                       ▼
-                fixed-size context
-                       │
-                       ▼
-                     LLM
+Context Assembly Engine
 ```
 
-The model sees only the most relevant information.
+that produces a bounded:
 
-The system, however, retains the complete information locally.
+```text
+ContextPlan
+```
 
-The fundamental goal is:
+and integrates it into the model request without breaking OpenAI compatibility or streaming behavior.
 
-> **Given a model with N tokens of context, construct the highest-value N-token representation of the entire available conversation for the current request, while retaining the complete original conversation outside the model.**
+Do not start M5 or M6 work.
+
+---
+
+# 23. M4 Acceptance Criteria
+
+M4 is complete only when:
+
+- [ ] Context Assembly Engine exists as a dedicated component.
+- [ ] Candidate sources are explicitly modeled.
+- [ ] Candidate fusion is deterministic.
+- [ ] Duplicate semantic content is removed without modifying raw history.
+- [ ] Superseded memories are excluded.
+- [ ] Relevance scoring is deterministic and configurable.
+- [ ] MMR/diversity selection is implemented and tested.
+- [ ] Context budget allocation is explicit.
+- [ ] System/tool/pinned/recent/retrieved/current-request budgets are accounted for.
+- [ ] Current request is preserved whenever it can fit.
+- [ ] Interaction units remain atomic.
+- [ ] Final context never exceeds the effective token budget.
+- [ ] Insufficient-budget behavior is deterministic.
+- [ ] ContextPlan contains useful diagnostics.
+- [ ] Conversation isolation is preserved.
+- [ ] OpenAI-compatible request/response behavior remains intact.
+- [ ] Streaming behavior remains intact.
+- [ ] Existing M0–M3 tests remain green.
+- [ ] New M4 tests cover all major invariants.
+- [ ] `pytest` passes.
+- [ ] `ruff check .` passes.
+- [ ] configured static checks pass.
+- [ ] no M5/M6 functionality is introduced.
+
+**Do not declare M4 complete until all acceptance criteria are satisfied.**

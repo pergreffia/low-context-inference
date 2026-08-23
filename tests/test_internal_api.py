@@ -423,3 +423,139 @@ def test_internal_api_validation_errors():
 
         r = client.get("/internal/v1/retrieval", params={"q": "x", "conversation_id": "zz"})
         assert r.status_code == 400
+
+
+class SlowHashingEmbedder(HashingEmbedder):
+    def __init__(self, delay: float):
+        self.delay = delay
+        self.cancelled = False
+
+    async def embed(self, texts):
+        import asyncio
+
+        try:
+            await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return await super().embed(texts)
+
+
+def test_index_timeout_leaves_chunks_retryable():
+    """§18/§26: timeout -> response OK, chunk pending, cleanup happens,
+    later retry with healthy provider marks it indexed."""
+
+    from context_proxy.config import DatabaseSettings, Settings
+    from context_proxy.main import create_app
+    from context_proxy.memory.service import MemoryService
+
+    settings = Settings(_env_file=None, database=DatabaseSettings(url=MIGRATION_DSN))
+    settings.memory.index_timeout_seconds = 0.05
+
+    app = create_app(
+        settings,
+        llm_client=httpx.AsyncClient(
+            base_url=str(settings.inference.base_url),
+            transport=httpx.MockTransport(_upstream),
+        ),
+    )
+    client = TestClient(app)
+    conv = str(uuid.uuid4())
+
+    with client:
+        store = client.app.state.store
+        pool = client.app.state.database.pool
+        slow_embedder = SlowHashingEmbedder(delay=0.5)
+        client.app.state.memory = MemoryService(
+            pool,
+            slow_embedder,
+            RecordingVectorStore(),
+            retrieval_settings=client.app.state.settings.retrieval,
+        )
+
+        async def seed(messages):
+            await store.append_messages(conv, messages)
+
+        async def states():
+            rows = await pool.fetch(
+                """
+                SELECT start_seq, vector_indexed_at FROM conversation_chunks
+                WHERE conversation_id = $1::uuid ORDER BY start_seq
+                """,
+                uuid.UUID(conv),
+            )
+            return [(r["start_seq"], r["vector_indexed_at"]) for r in rows]
+
+        def run_async(coro):
+            return client.portal.start_task_soon(lambda: coro).result()
+
+        run_async(seed([{"role": "user", "content": "alpha question"}]))
+        r1 = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [{"role": "user", "content": "alpha question"}],
+                "conversation_id": conv,
+            },
+        )
+        assert r1.status_code == 200
+
+        # complete turn 1 (assistant already persisted by r1); the next
+        # auto-index pass times out
+        run_async(seed([{"role": "user", "content": "beta question"}]))
+        r2 = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "alpha question"},
+                    {"role": "assistant", "content": "reply one"},
+                    {"role": "user", "content": "beta question"},
+                ],
+                "conversation_id": conv,
+            },
+        )
+        assert r2.status_code == 200
+
+        st = run_async(states())
+        assert len(st) == 1 and st[0][0] == 0
+        assert st[0][1] is None  # timed out -> still pending
+        assert slow_embedder.cancelled is True  # cancellation cleaned up
+
+    # fresh process-style retry: healthy provider marks the chunk indexed
+    app2 = create_app(
+        Settings(_env_file=None, database=DatabaseSettings(url=MIGRATION_DSN)),
+        llm_client=httpx.AsyncClient(
+            base_url="http://up.test/v1",
+            transport=httpx.MockTransport(_upstream),
+        ),
+    )
+    with TestClient(app2) as client2:
+        pool = client2.app.state.database.pool
+        fast_memory = MemoryService(
+            pool,
+            HashingEmbedder(),
+            RecordingVectorStore(),
+            retrieval_settings=client2.app.state.settings.retrieval,
+        )
+
+        async def reindex():
+            return await fast_memory.index_completed_turns(conv)
+
+        fut = client2.portal.start_task_soon(lambda: reindex())
+        created = fut.result()
+
+        async def states():
+            rows = await pool.fetch(
+                """
+                SELECT start_seq, vector_indexed_at FROM conversation_chunks
+                WHERE conversation_id = $1::uuid ORDER BY start_seq
+                """,
+                uuid.UUID(conv),
+            )
+            return [(r["start_seq"], r["vector_indexed_at"] is not None) for r in rows]
+
+        fut2 = client2.portal.start_task_soon(lambda: states())
+        st = fut2.result()
+    assert created == 0
+    assert st == [(0, True)]

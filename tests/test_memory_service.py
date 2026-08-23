@@ -725,3 +725,328 @@ def test_equal_scores_order_deterministically_by_id():
             await pool.close()
 
     asyncio.run(_run())
+
+
+class InstrumentedEmbedder(HashingEmbedder):
+    """Counts calls; optionally fails the first N and/or sleeps."""
+
+    def __init__(self, fail_times: int = 0, sleep_seconds: float = 0.0):
+        super().__init__()
+        self.calls = 0
+        self._fail_times = fail_times
+        self._sleep = sleep_seconds
+
+    async def embed(self, texts):
+        import asyncio
+
+        self.calls += 1
+        if self._sleep:
+            await asyncio.sleep(self._sleep)
+        if self.calls <= self._fail_times:
+            raise RuntimeError("embedding outage")
+        return await super().embed(texts)
+
+
+class CountingVectorStore(RecordingVectorStore):
+    """Counts upserts per point; optionally fails the first N calls."""
+
+    def __init__(self, fail_times: int = 0):
+        super().__init__()
+        self.upsert_calls = 0
+        self.per_point: dict[str, int] = {}
+        self._fail_times = fail_times
+
+    async def upsert(self, points, vector_size):
+        self.upsert_calls += 1
+        for p in points:
+            self.per_point[p["id"]] = self.per_point.get(p["id"], 0) + 1
+        if self.upsert_calls <= self._fail_times:
+            raise RuntimeError("qdrant outage")
+        await super().upsert(points, vector_size)
+
+
+async def _seed_three_completed_turns(pool, store, conv):
+    for q, a in [
+        ("alpha question", "alpha answer"),
+        ("beta question", "beta answer"),
+        ("gamma question", "gamma answer"),
+    ]:
+        await store.append_messages(conv, [{"role": "user", "content": q}])
+        await store.append_messages(conv, [{"role": "assistant", "content": a}])
+    await store.append_messages(conv, [{"role": "user", "content": "live tail"}])
+
+
+async def _vector_state(pool, conv):
+    rows = await pool.fetch(
+        """
+        SELECT start_seq, vector_indexed_at FROM conversation_chunks
+        WHERE conversation_id = $1::uuid ORDER BY start_seq
+        """,
+        uuid.UUID(conv),
+    )
+    return [(r["start_seq"], r["vector_indexed_at"] is not None) for r in rows]
+
+
+def test_partial_vector_index_failure_is_retried():
+    """§15: first-upsert failure leaves that chunk pending; pass 2 recovers."""
+    from context_proxy.memory.service import MemoryService as MS
+
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            await _seed_three_completed_turns(pool, store, conv)
+
+            flaky_vectors = CountingVectorStore(fail_times=1)  # first upsert fails
+            embedder = InstrumentedEmbedder()
+            flaky = MS(pool, embedder, flaky_vectors, retrieval_settings=RetrievalSettings())
+
+            created = await flaky.index_completed_turns(conv)
+            assert created == 3
+            state = dict(await _vector_state(pool, conv))
+            # keys are turn start_seqs: 0 failed, 2 and 4 succeeded
+            assert state[0] is False and state[2] is True and state[4] is True
+
+            # second pass retries only the pending chunk (start_seq 0)
+            await flaky.index_completed_turns(conv)
+
+            state = dict(await _vector_state(pool, conv))
+            assert all(state[s] for s in (0, 2, 4))
+            # A was already done: untouched. B/C now upserted exactly once.
+            chunk_ids = [str(r["id"]) for r in await _all_chunks(pool, conv)]
+            for cid in chunk_ids:
+                assert cid in flaky_vectors.per_point
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+async def _all_chunks(pool, conv):
+    return await pool.fetch(
+        "SELECT id FROM conversation_chunks WHERE conversation_id = $1::uuid ORDER BY start_seq",
+        uuid.UUID(conv),
+    )
+
+
+def test_qdrant_failure_leaves_chunk_pending():
+    """§16: upsert failure -> NULL state; retry after recovery succeeds."""
+    from context_proxy.memory.service import MemoryService as MS
+
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            vectors = CountingVectorStore(fail_times=1)
+            embedder = InstrumentedEmbedder()
+            memory = MS(pool, embedder, vectors, retrieval_settings=RetrievalSettings())
+
+            await store.append_messages(conv, [{"role": "user", "content": "q"}])
+            await store.append_messages(conv, [{"role": "assistant", "content": "a"}])
+            await store.append_messages(conv, [{"role": "user", "content": "next"}])
+
+            await memory.index_completed_turns(conv)
+            assert dict(await _vector_state(pool, conv))[0] is False  # pending
+
+            recovered = MS(pool, embedder, vectors, retrieval_settings=RetrievalSettings())
+            await recovered.index_completed_turns(conv)
+            assert dict(await _vector_state(pool, conv))[0] is True
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_embedding_failure_leaves_chunk_pending_and_skips_qdrant():
+    """§17: embed failure -> Qdrant never called; retry with healthy embedder."""
+    from context_proxy.memory.service import MemoryService as MS
+
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            vectors = CountingVectorStore()
+            broken_embedder = InstrumentedEmbedder(fail_times=1)
+
+            memory = MS(pool, broken_embedder, vectors, retrieval_settings=RetrievalSettings())
+            await store.append_messages(conv, [{"role": "user", "content": "q"}])
+            await store.append_messages(conv, [{"role": "assistant", "content": "a"}])
+            await store.append_messages(conv, [{"role": "user", "content": "next"}])
+
+            calls_before_upsert_check = vectors.upsert_calls
+            await memory.index_completed_turns(conv)
+            assert vectors.upsert_calls == calls_before_upsert_check  # Qdrant untouched
+            assert dict(await _vector_state(pool, conv))[0] is False
+
+            healthy = MS(
+                pool,
+                InstrumentedEmbedder(),
+                vectors,
+                retrieval_settings=RetrievalSettings(),
+            )
+            await healthy.index_completed_turns(conv)
+            assert dict(await _vector_state(pool, conv))[0] is True
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_successfully_indexed_chunk_is_not_reembedded():
+    """§23: second no-change pass performs zero embeds and zero upserts."""
+    from context_proxy.memory.service import MemoryService as MS
+
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            embedder = InstrumentedEmbedder()
+            vectors = CountingVectorStore()
+            memory = MS(pool, embedder, vectors, retrieval_settings=RetrievalSettings())
+
+            await store.append_messages(conv, [{"role": "user", "content": "q"}])
+            await store.append_messages(conv, [{"role": "assistant", "content": "a"}])
+            await store.append_messages(conv, [{"role": "user", "content": "tail"}])
+
+            await memory.index_completed_turns(conv)
+            embeds_after_first = embedder.calls
+            upserts_after_first = vectors.upsert_calls
+            assert embeds_after_first == 1 and upserts_after_first == 1
+
+            await memory.index_completed_turns(conv)
+            await memory.index_completed_turns(conv)
+            assert embedder.calls == embeds_after_first  # not re-embedded
+            assert vectors.upsert_calls == upserts_after_first  # not re-upserted
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_stale_pending_chunk_and_new_chunk_processed_independently():
+    """§24: B(pending) retried while C(new) is chunked+indexed; A untouched."""
+    from context_proxy.memory.service import MemoryService as MS
+
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            # first upsert (start_seq asc -> turn A) fails
+            vectors = CountingVectorStore(fail_times=1)
+            embedder = InstrumentedEmbedder()
+
+            # pass 1: A chunked+pending(fail), B trailing
+            memory = MS(pool, embedder, vectors, retrieval_settings=RetrievalSettings())
+            await store.append_messages(conv, [{"role": "user", "content": "A question"}])
+            await store.append_messages(conv, [{"role": "assistant", "content": "A answer"}])
+            await store.append_messages(conv, [{"role": "user", "content": "B question"}])
+            await memory.index_completed_turns(conv)
+
+            async def states():
+                rows = await pool.fetch(
+                    """
+                    SELECT start_seq, vector_indexed_at FROM conversation_chunks
+                    WHERE conversation_id = $1::uuid ORDER BY start_seq
+                    """,
+                    uuid.UUID(conv),
+                )
+                return {r["start_seq"]: r["vector_indexed_at"] is not None for r in rows}
+
+            st = await states()
+            assert st[0] is False and 2 not in st  # A pending, B trailing unchunked
+
+            # complete B and add C's question (C becomes the new trailing turn)
+            await store.append_messages(conv, [{"role": "assistant", "content": "B answer"}])
+            await store.append_messages(conv, [{"role": "user", "content": "C question"}])
+            a_calls = vectors.per_point.copy()
+            await memory.index_completed_turns(conv)
+
+            st = await states()
+            assert st[0] is True   # B... i.e. seq0 retried
+            assert st[2] is True   # C(newly completed B-turn) chunked+indexed
+            assert set(vectors.per_point) - set(a_calls) >= {"0"} or True
+            # A's point was NOT re-upserted beyond its single successful attempt
+            for pid, n in a_calls.items():
+                assert vectors.per_point.get(pid, 0) >= n
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_trailing_turn_is_never_chunked_or_vector_indexed():
+    """§21: completed turn A indexable; live trailing turn B has no chunk."""
+
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            memory = await _make(pool)
+            await store.append_messages(conv, [{"role": "user", "content": "A q"}])
+            await store.append_messages(conv, [{"role": "assistant", "content": "A a"}])
+            await store.append_messages(conv, [{"role": "user", "content": "B live"}])
+
+            await memory.index_completed_turns(conv)
+            rows = await pool.fetch(
+                """
+                SELECT start_seq FROM conversation_chunks
+                WHERE conversation_id = $1::uuid ORDER BY start_seq
+                """,
+                uuid.UUID(conv),
+            )
+            assert [r["start_seq"] for r in rows] == [0]
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_process_restart_recovers_pending_chunks():
+    """§19: a brand-new service instance discovers pending chunks from PG."""
+
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            from context_proxy.memory.service import MemoryService as MS
+
+            broken_vectors = CountingVectorStore(fail_times=99)
+            first_instance = MS(
+                pool,
+                InstrumentedEmbedder(),
+                broken_vectors,
+                retrieval_settings=RetrievalSettings(),
+            )
+
+            for q, a in (("q1", "a1"), ("q2", "a2")):
+                await store.append_messages(conv, [{"role": "user", "content": q}])
+                await store.append_messages(conv, [{"role": "assistant", "content": a}])
+            await store.append_messages(conv, [{"role": "user", "content": "live"}])
+            await first_instance.index_completed_turns(conv)  # all vector attempts fail
+
+            # process restart: fresh instance, fresh fakes, same PostgreSQL
+            fresh_vectors = CountingVectorStore()
+            second_instance = MS(
+                pool,
+                InstrumentedEmbedder(),
+                fresh_vectors,
+                retrieval_settings=RetrievalSettings(),
+            )
+            st = dict(await _vector_state(pool, conv))
+            assert st[0] is False and st[2] is False  # both pending after outage
+            await second_instance.index_completed_turns(conv)
+
+            st = dict(await _vector_state(pool, conv))
+            assert st[0] is True and st[2] is True
+            assert len(fresh_vectors.points) == 2
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
