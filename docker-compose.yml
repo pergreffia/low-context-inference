@@ -1,0 +1,56 @@
+services:
+  context-proxy:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE__URL: postgresql://${POSTGRES_USER:-context_proxy}:${POSTGRES_PASSWORD:-context_proxy}@postgres:5432/${POSTGRES_DB:-context_proxy}
+    ports:
+      - "${SERVER__PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-context_proxy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-context_proxy}
+      POSTGRES_DB: ${POSTGRES_DB:-context_proxy}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-context_proxy} -d ${POSTGRES_DB:-context_proxy}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    ports:
+      - "6333:6333"
+      - "6344:6344"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':< /dev/tcp/localhost/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # M3/M4: memory-service, embedding-service, compact-service join here.
+
+volumes:
+  pgdata:
+  qdrant_storage:
