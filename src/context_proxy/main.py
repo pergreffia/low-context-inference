@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from context_proxy.api.routes import router
 from context_proxy.api.routes_internal import router as internal_router
 from context_proxy.config import Settings, load_settings
+from context_proxy.context.engine import ContextAssemblyEngine
 from context_proxy.conversation.store import PostgresConversationStore
 from context_proxy.db.database import Database
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
@@ -28,6 +29,7 @@ def create_app(
     memory_service=None,
     embedding_client: httpx.AsyncClient | None = None,
     qdrant_client: httpx.AsyncClient | None = None,
+    context_engine: ContextAssemblyEngine | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     database = database or Database(settings.database)
@@ -90,6 +92,19 @@ def create_app(
     app = FastAPI(title="Context Proxy", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.llm = OpenAICompatibleLLMProvider(settings.inference, client=llm_client)
+    # The engine owns no network resources: it is plain configuration plus
+    # pure selection logic, so it can be built eagerly (M4).
+    if context_engine is not None:
+        # Test/injected engine wins over the configured one.
+        app.state.context_engine = context_engine
+    elif settings.assembly.enabled:
+        app.state.context_engine = ContextAssemblyEngine(
+            usable_budget=settings.context.usable_budget_tokens,
+            settings=settings.assembly,
+            retrieval_settings=settings.retrieval,
+        )
+    else:
+        app.state.context_engine = None
     app.include_router(router)
     app.include_router(internal_router)
 

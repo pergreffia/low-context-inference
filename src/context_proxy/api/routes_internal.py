@@ -10,7 +10,11 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
+from context_proxy.context.engine import (
+    ContextOverflowError as EngineContextOverflowError,
+)
 from context_proxy.memory.models import (
     MemoryCreate,
     RetrievalResponse,
@@ -18,6 +22,13 @@ from context_proxy.memory.models import (
 )
 
 router = APIRouter(prefix="/internal/v1")
+
+
+class ContextPreviewRequest(BaseModel):
+    """Mirror of the chat payload fields the engine plans against."""
+
+    messages: list[dict] = Field(default_factory=list)
+    tools: list[dict] | None = None
 
 
 def _parse_uuid(value: str, what: str) -> uuid.UUID:
@@ -78,3 +89,44 @@ async def index_conversation(conversation_id: str, request: Request):
     memory = _memory(request)
     created = await memory.index_completed_turns(parsed)
     return {"chunks_created": created}
+
+
+@router.post("/conversations/{conversation_id}/context/preview")
+async def context_preview(
+    conversation_id: str, request: Request, body: ContextPreviewRequest
+):
+    """Dry-run the Context Assembly Engine for one conversation (M4 §11.11).
+
+    Read-only: no persistence mutation, no inference call. The response is a
+    diagnostic view (ids, scores, tokens, reasons) without raw message
+    content, scoped strictly to the requested conversation.
+    """
+    parsed = _parse_uuid(conversation_id, "conversation_id")
+    engine = getattr(request.app.state, "context_engine", None)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="context engine unavailable")
+
+    retrieved = []
+    memory = getattr(request.app.state, "memory", None)
+    if memory is not None and body.messages:
+        query_parts = [
+            m.get("content") or ""
+            for m in reversed(body.messages)
+            if m.get("role") == "user" and isinstance(m.get("content"), str)
+        ]
+        if query_parts:
+            try:
+                retrieved = await memory.retrieve(query_parts[0], parsed)
+            except Exception:  # noqa: BLE001 - preview degrades exactly like prod
+                retrieved = []
+
+    try:
+        plan = engine.build(
+            messages=body.messages,
+            tools=body.tools,
+            retrieved=retrieved,
+            conversation_id=str(parsed),
+        )
+    except EngineContextOverflowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return plan.debug_view()

@@ -14,6 +14,7 @@ from context_proxy.api.responses import (
     upstream_response,
 )
 from context_proxy.capture import PersistingLLMStream
+from context_proxy.context.engine import ContextOverflowError as EngineOverflowError
 from context_proxy.context.planner import ContextOverflowError, plan_context
 from context_proxy.conversation.identity import (
     RESPONSE_CONVERSATION_HEADER,
@@ -31,6 +32,24 @@ def _conversation_headers(conversation_id: str | None) -> dict[str, str]:
     if conversation_id is None:
         return {}
     return {RESPONSE_CONVERSATION_HEADER: conversation_id}
+
+
+def _retrieval_query(messages: list[dict]) -> str:
+    """Text of the latest user message; multimodal parts contribute their text."""
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                str(part.get("text") or "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ).strip()
+        return ""
+    return ""
 
 
 @router.get("/v1/models")
@@ -91,19 +110,45 @@ async def chat_completions(request: Request):
             logger.warning("inbound_persistence_failed", extra={"error": str(exc)})
             store = None
 
-    # 2. Budget the raw recent window; never exceed the usable budget (§15).
-    # pinned_budget_tokens is reserved now so M3+ pinned injection cannot
-    # silently push the final context over budget.
+    # 2. Assemble the model context within the usable budget (M4 §11).
+    #    When the Context Assembly Engine is available it fuses recent raw
+    #    turns with best-effort retrieval (memories/chunks, conversation-
+    #    scoped, active-only), deduplicates, applies MMR diversity, and packs
+    #    the result into a deterministic ContextPlan. Otherwise the M2 raw
+    #    window planner is used. Both paths guarantee: never exceed budget,
+    #    current request preserved, atomic interaction units.
     messages = payload.get("messages") or []
     tools = payload.get("tools")
+    engine = getattr(app_state, "context_engine", None)
     try:
-        plan = plan_context(
-            messages,
-            tools=tools,
-            usable_budget=settings.context.usable_budget_tokens,
-            reserved_tokens=settings.context.pinned_budget_tokens,
-        )
-    except ContextOverflowError as exc:
+        if engine is not None:
+            retrieved: list = []
+            memory = getattr(app_state, "memory", None)
+            if memory is not None and messages:
+                query = _retrieval_query(messages)
+                if query:
+                    try:
+                        retrieved = await memory.retrieve(query, conversation_id)
+                    except Exception as exc:  # noqa: BLE001 - degrade to raw-only (§10.4)
+                        logger.warning(
+                            "context_retrieval_failed",
+                            extra={"conversation_id": conversation_id, "error": str(exc)},
+                        )
+            plan = engine.build(
+                messages=messages,
+                tools=tools,
+                retrieved=retrieved,
+                conversation_id=conversation_id,
+            )
+        else:
+            plan = plan_context(
+                messages,
+                tools=tools,
+                usable_budget=settings.context.usable_budget_tokens,
+                reserved_tokens=settings.context.pinned_budget_tokens,
+            )
+        out_messages = plan.messages
+    except (ContextOverflowError, EngineOverflowError) as exc:
         return openai_error(
             str(exc),
             err_type="invalid_request_error",
@@ -112,7 +157,7 @@ async def chat_completions(request: Request):
             status_code=400,
             headers=extra_headers,
         )
-    out_payload = {**payload, "messages": plan.messages}
+    out_payload = {**payload, "messages": out_messages}
 
     async def persist_assistant(message: dict | None, metadata: dict | None = None) -> None:
         """Best-effort assistant persistence + memory indexing (M2.3/M3).

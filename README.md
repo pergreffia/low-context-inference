@@ -4,7 +4,32 @@ Model-agnostic context management proxy exposing an OpenAI-compatible API. Lets 
 
 See `context-proxy-master-prompt.md` for the full design.
 
-## Status: M3 — Memory Service
+## Status: M4 — Context Assembly Engine
+
+M3 memory service plus a dedicated **Context Assembly Engine** (`context/engine.py`) that decides what context actually reaches the model:
+
+```text
+candidate fusion → deduplication → supersession filtering
+    → relevance scoring → MMR diversity → budget allocation
+    → packing → ContextPlan
+```
+
+- **Explicit candidate sources**: system messages, tool definitions, pinned context, the current request, recent raw interaction units, retrieved memories, retrieved chunks — each carrying stable keys, token counts, and score components for deterministic selection.
+- **Category precedence under budget pressure**: system + tools > pinned > current request > recent turns (newest-first, one contiguous window) > retrieved blocks (MMR order). Recent raw truth outranks derived memories by design.
+- **Deduplication without touching raw state**: a memory restating a recent turn, or a chunk whose stored JSON-lines match the live window, is dropped from the *assembled request only*; persisted history is never rewritten. Identical messages legitimately repeated in raw history survive (no content-based dedup of authoritative data).
+- **Supersession + isolation defense-in-depth**: PostgreSQL already returns active-only records; the engine additionally rejects any superseded id passed by the caller and any retrieval block whose `conversation_id` differs from the request's.
+- **Deterministic scoring & MMR**: weighted components (semantic/lexical/recency/importance/type — same weights as hybrid retrieval), greedy MMR with `ASSEMBLY__MMR_LAMBDA`, ties always broken by stable key. Identical inputs produce byte-identical plans.
+- **Budget guarantees**: the final context never exceeds `usable = model_limit − safety_margin`; tool definitions consume budget; if system + tools + pinned + current request alone cannot fit, the proxy answers OpenAI `context_length_exceeded` (HTTP 400) before any inference call.
+- **Diagnostics**: every plan records selected/dropped items with reasons (`duplicate`, `superseded`, `foreign_conversation`, `budget`, `not_selected`), category token accounting, and weights. `POST /internal/v1/conversations/{id}/context/preview` returns a read-only debug view (ids/scores/reasons only, no raw content) scoped to one conversation.
+- **Compatibility unchanged**: streaming SSE passthrough, response bodies, headers, usage metadata and M0–M3 behavior are untouched; retrieval outages degrade to raw-recent context automatically.
+
+Configuration: `ASSEMBLY__ENABLED` (default on; off restores the M2 window planner), `ASSEMBLY__MMR_LAMBDA`, `ASSEMBLY__MAX_RETRIEVED_ITEMS`, `ASSEMBLY__RETRIEVED_BUDGET_TOKENS`.
+
+Not yet implemented: pinned-context ingestion source (the engine packs it, but no API populates it yet), summaries as candidate source, compaction.
+
+## Previous milestones
+
+### M3 — Memory Service
 
 M2 foundation plus:
 
@@ -14,11 +39,9 @@ M2 foundation plus:
 - **Indexing latency**: chunking/embedding/vector-upsert run synchronously after the response is persisted but are bounded by `MEMORY__INDEX_TIMEOUT_SECONDS` (default 10s); timeouts and failures never alter the HTTP response. Background workers can replace this later without interface changes.
 - **Internal API**: `/internal/v1/memories` (create/supersede), `/internal/v1/memories/{id}/supersede`, `/internal/v1/retrieval?q=&conversation_id=`, `/internal/v1/conversations/{id}/index`.
 
-Not yet implemented: memory *extraction* from conversations and compaction (M4), diversity/MMR + budget selection + prompt injection of retrieved context (M5).
+Not yet implemented at M3: memory *extraction* from conversations and compaction, diversity/MMR + budget selection + prompt injection of retrieved context.
 
-Previous milestones:
-
-## M2 — Conversation Management
+### M2 — Conversation Management
 
 M1 foundation plus:
 
@@ -83,4 +106,8 @@ The proxy forwards requests to the configured inference endpoint and passes resp
 pytest
 ```
 
-Integration test for PostgreSQL migrations auto-skips when no server is reachable.
+PostgreSQL-backed suites (store, concurrency, memory service, engine integration) run when `TEST_DATABASE_URL` is set, e.g.:
+
+```bash
+TEST_DATABASE_URL=postgresql://context_proxy:context_proxy@localhost:5433/context_proxy pytest
+```

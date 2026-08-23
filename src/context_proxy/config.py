@@ -63,6 +63,22 @@ class MemorySettings(BaseModel):
     index_timeout_seconds: float = Field(default=10.0, gt=0)
 
 
+class AssemblySettings(BaseModel):
+    """Context Assembly Engine knobs (master prompt §11).
+
+    Scoring weights are shared with RetrievalSettings (single source of truth
+    for hybrid relevance); this model adds MMR diversity and per-category
+    budget caps. All selection is deterministic.
+    """
+
+    enabled: bool = True
+    # MMR trade-off: 1.0 = pure relevance, 0.0 = pure diversity.
+    mmr_lambda: float = Field(default=0.7, ge=0.0, le=1.0)
+    max_retrieved_items: int = Field(default=8, ge=0)
+    # Hard cap for the retrieved category (tier 5) within the usable budget.
+    retrieved_budget_tokens: int = Field(default=4000, ge=0)
+
+
 class ContextSettings(BaseModel):
     """Context budget configuration (master prompt §14, §15).
 
@@ -92,6 +108,7 @@ class Settings(BaseSettings):
     server: ServerSettings = ServerSettings()
     database: DatabaseSettings = DatabaseSettings()
     context: ContextSettings = ContextSettings()
+    assembly: AssemblySettings = AssemblySettings()
     conversation: ConversationSettings = ConversationSettings()
     inference: EndpointSettings = EndpointSettings()
     qdrant: QdrantSettings = QdrantSettings()
