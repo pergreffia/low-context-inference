@@ -135,6 +135,43 @@ def test_downstream_disconnect_closes_upstream_response():
     assert "closed" in events
 
 
+def test_task_cancellation_mid_stream_closes_upstream_response():
+    """Hard cancellation: consumer task killed mid-iteration -> upstream closed.
+
+    Limitation: a true ASGI client disconnect cannot be simulated with
+    TestClient; task cancellation exercises the same generator-cancellation
+    path that Starlette's disconnect listener triggers.
+    """
+
+    events: list[str] = []
+
+    async def endless_agen():
+        while True:
+            yield b"data: x\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _tracked_sse_response(endless_agen, events)
+
+    provider, _client = _provider_with(handler)
+
+    async def scenario() -> None:
+        stream = await provider.open_stream(chat_payload())  # type: ignore[attr-defined]
+        consumer = asyncio.create_task(consume_few(stream))
+        await asyncio.sleep(0)  # let it start consuming
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        await provider.aclose()  # type: ignore[attr-defined]
+
+    async def consume_few(stream) -> None:
+        async for _chunk in stream.iter_bytes():
+            await asyncio.sleep(0)  # simulate slow downstream
+
+    asyncio.run(scenario())
+
+    assert "closed" in events
+
+
 def test_full_sse_body_forwarded_through_http_stack():
     def handler(request: httpx.Request) -> httpx.Response:
         async def agen():

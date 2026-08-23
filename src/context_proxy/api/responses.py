@@ -15,6 +15,7 @@ def openai_error(
     code: str | None = None,
     param: str | None = None,
     status_code: int = 500,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
@@ -26,6 +27,7 @@ def openai_error(
                 "code": code,
             }
         },
+        headers=headers or None,
     )
 
 
@@ -72,19 +74,22 @@ async def error_body_response(exc: Exception) -> Response:
         if exc.content_type.startswith("application/json"):
             try:
                 json.loads(exc.body)
-                if not any(n.lower() == "content-type" for n in headers):
-                    headers["Content-Type"] = exc.content_type
                 return Response(
                     content=exc.body,
                     status_code=exc.status_code,
-                    headers=headers,
+                    headers=ensure_content_type(headers, default=exc.content_type),
                 )
             except (ValueError, UnicodeDecodeError):
                 pass
+        # Normalized fallback body is JSON: the upstream Content-Type (e.g.
+        # text/plain) must not leak onto the rewritten body, but safe metadata
+        # headers (Retry-After, X-RateLimit-*, X-Request-ID) survive.
+        safe_headers = {n: v for n, v in headers.items() if n.lower() != "content-type"}
         return openai_error(
             "upstream inference endpoint returned an error",
             err_type="upstream_error",
             status_code=exc.status_code,
+            headers=safe_headers,
         )
     if isinstance(exc, UpstreamUnavailable):
         return openai_error(

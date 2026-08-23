@@ -32,6 +32,22 @@ STRIPPED_RESPONSE_HEADERS = HOP_BY_HOP_HEADERS | {
 DEFAULT_CONTENT_TYPE = "application/json"
 
 
+def connection_named_headers(headers: Mapping[str, str]) -> frozenset[str]:
+    """Header names listed as tokens in the Connection header (RFC 9110 §7.6.1).
+
+    These are connection-specific regardless of their name and must not be
+    forwarded.
+    """
+    connection_value = get_header(headers, "connection")
+    if not connection_value:
+        return frozenset()
+    return frozenset(
+        token.strip().lower()
+        for token in connection_value.split(",")
+        if token.strip()
+    )
+
+
 def filter_response_headers(
     headers: Mapping[str, str],
     *,
@@ -43,7 +59,7 @@ def filter_response_headers(
     so their content-encoding must be dropped to stay truthful about the body.
     Raw streaming passthrough keeps it.
     """
-    stripped = STRIPPED_RESPONSE_HEADERS
+    stripped = STRIPPED_RESPONSE_HEADERS | connection_named_headers(headers)
     if not keep_content_encoding:
         stripped = stripped | {"content-encoding"}
     return {name: value for name, value in headers.items() if name.lower() not in stripped}
