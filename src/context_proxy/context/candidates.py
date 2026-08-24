@@ -65,11 +65,28 @@ def canonical_text(value: str) -> str:
     return _WHITESPACE.sub(" ", value).strip().lower()
 
 
-def _image_fingerprint(url: str) -> str:
-    """Short stable fingerprint of an image payload for identity purposes."""
+def _sha256_hex(value: str) -> str:
+    """Full SHA-256 hex digest — collision-resistant identity component."""
     import hashlib
 
-    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _part_fingerprint(part: dict[str, Any]) -> str:
+    """Deterministic fingerprint of an opaque multimodal part (M6 review §3).
+
+    Canonical JSON (sorted keys, tight separators) makes the hash independent
+    of JSON key order; the raw payload never enters logs or canonical text.
+    """
+    canonical_json = json.dumps(
+        part, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return _sha256_hex(canonical_json)
+
+
+def _image_fingerprint(url: str) -> str:
+    """Full-length stable fingerprint of an image source URL."""
+    return _sha256_hex(url)
 
 
 def message_texts(messages: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> str:
@@ -79,25 +96,28 @@ def message_texts(messages: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -
     storing JSON-lines of persisted messages compares equal to the recent
     window holding the same interaction.
 
-    Multimodal parts (M6 §13.1): text parts contribute their text; image
-    parts contribute a short content fingerprint — two interactions with the
-    same text but different images must NOT collapse into one identity.
+    Multimodal parts (M6 §13.1): text parts contribute their text; image and
+    unknown parts contribute fingerprints — same text but different payloads
+    must NOT collapse into one identity.
+
+    Tool calls (M6 review §1) are ALWAYS rendered after the content,
+    whatever its shape: name + arguments form the semantic identity (ids are
+    transport noise).
     """
     parts: list[str] = []
     for message in messages:
         role = message.get("role")
         content = message.get("content")
         if isinstance(content, str):
-            parts.append(f"{role}: {content}")
-            continue
-        if isinstance(content, list):
-            rendered: list[str] = []
+            rendered_content = content
+        elif isinstance(content, list):
+            rendered_parts: list[str] = []
             for part in content:
                 if not isinstance(part, dict):
                     continue
                 kind = part.get("type")
                 if kind == "text":
-                    rendered.append(str(part.get("text") or ""))
+                    rendered_parts.append(str(part.get("text") or ""))
                 elif kind == "image_url":
                     image_url = part.get("image_url") or {}
                     url = (
@@ -105,12 +125,15 @@ def message_texts(messages: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -
                         if isinstance(image_url, dict)
                         else str(image_url)
                     )
-                    rendered.append(f"[image:{_image_fingerprint(str(url))}]")
+                    rendered_parts.append(f"[image:{_image_fingerprint(str(url))}]")
                 else:
-                    rendered.append(f"[{kind or 'unknown'}]")
-            parts.append(f"{role}: " + " ".join(rendered))
-            continue
-        parts.append(f"{role}: ")
+                    rendered_parts.append(
+                        f"[{kind or 'unknown'}:{_part_fingerprint(part)}]"
+                    )
+            rendered_content = " ".join(rendered_parts)
+        else:
+            rendered_content = ""
+        parts.append(f"{role}: {rendered_content}")
         for tool_call in message.get("tool_calls") or []:
             function = tool_call.get("function") or {}
             parts.append(
@@ -122,9 +145,8 @@ def message_texts(messages: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -
 def content_texts(message: dict[str, Any]) -> list[str]:
     """Canonical per-part texts of ONE message (dedup keys, M6-aware).
 
-    Text parts contribute their text; image parts contribute their
-    fingerprint token so identical-text/different-image interactions keep
-    distinct identities.
+    Text parts contribute their text; image parts their full fingerprint;
+    unknown parts a type+fingerprint token so payload changes change identity.
     """
     content = message.get("content")
     if isinstance(content, str):
@@ -149,7 +171,7 @@ def content_texts(message: dict[str, Any]) -> list[str]:
                 )
                 out.append(f"[image:{_image_fingerprint(str(url))}]")
             else:
-                out.append(f"[{kind or 'unknown'}]")
+                out.append(f"[{kind or 'unknown'}:{_part_fingerprint(part)}]")
         return out
     return []
 

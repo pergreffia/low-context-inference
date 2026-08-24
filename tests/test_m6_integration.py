@@ -55,7 +55,7 @@ def test_media_registry_and_raw_reconstruction():
 
             rows = await pool.fetch(
                 """
-                SELECT part_index, kind, source, byte_size
+                SELECT part_index, kind, source, source_size
                 FROM conversation_media
                 WHERE conversation_id = $1::uuid
                 ORDER BY message_id, part_index
@@ -67,7 +67,9 @@ def test_media_registry_and_raw_reconstruction():
             assert row["part_index"] == 1  # second part of the first message
             assert row["kind"] == "image_url"
             assert row["source"] == "data"
-            assert row["byte_size"] == len(DATA_URL)
+            # source_size = length of the source reference string (the data
+            # URL as sent), never decoded media bytes
+            assert row["source_size"] == len(DATA_URL)
 
             # authoritative reconstruction is EXACT, images included
             persisted = await store.get_messages(conv)

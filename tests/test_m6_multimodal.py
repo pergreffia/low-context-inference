@@ -266,3 +266,209 @@ class TestMultimodalReconciliationIdempotency:
         assert calls[0] == body["messages"]
         assert calls[1] == calls[3]
         assert calls[1][-1]["content"] == "hello"
+
+
+# --------------------------------------- M6 review: canonical identity fixes
+
+
+def _tool_call(name: str, arguments: str) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": "I'll inspect that",
+        "tool_calls": [
+            {"id": f"call_{name}", "type": "function",
+             "function": {"name": name, "arguments": arguments}}
+        ],
+    }
+
+
+class TestToolCallIdentity:
+    """tool_calls always contribute to canonical identity (review §1)."""
+
+    def test_string_content_plus_tool_call_is_fully_canonical(self):
+        from context_proxy.context.candidates import message_texts
+
+        text = message_texts([_tool_call("read_file", '{"path":"foo.py"}')])
+        assert "read_file" in text
+        assert "foo.py" in text
+        assert "I'll inspect that" in text
+
+    def test_multimodal_content_plus_tool_call_keeps_both(self):
+        from context_proxy.context.candidates import message_texts
+
+        message = _tool_call("read_file", "{}")
+        message["content"] = [
+            {"type": "text", "text": "I'll inspect that"},
+            {"type": "image_url", "image_url": {"url": DATA_URL}},
+        ]
+        text = message_texts([message])
+        assert "read_file" in text
+        assert "[image:" in text
+        assert "I'll inspect that" in text
+
+    def test_different_arguments_different_identity(self):
+        from context_proxy.context.candidates import (
+            canonical_text,
+            message_texts,
+        )
+
+        unit_a = [
+            {"role": "user", "content": "go"},
+            _tool_call("read_file", '{"path":"foo.py"}'),
+            {"role": "tool", "tool_call_id": "call_read_file", "content": "data"},
+        ]
+        unit_b = [
+            {"role": "user", "content": "go"},
+            _tool_call("read_file", '{"path":"bar.py"}'),
+            {"role": "tool", "tool_call_id": "call_read_file", "content": "data"},
+        ]
+        assert canonical_text(message_texts(unit_a)) != canonical_text(
+            message_texts(unit_b)
+        )
+
+    def test_identical_units_same_identity(self):
+        from context_proxy.context.candidates import (
+            canonical_text,
+            message_texts,
+        )
+
+        unit = [_tool_call("read_file", '{"path":"foo.py"}')]
+        assert canonical_text(message_texts(unit)) == canonical_text(
+            message_texts(list(unit))
+        )
+
+
+class TestImageFingerprintRobustness:
+    """Full-length SHA-256 fingerprints (review §2)."""
+
+    def test_fingerprint_length_is_64_hex(self):
+        from context_proxy.context.candidates import content_texts
+
+        texts = content_texts(multimodal_message("d", DATA_URL))
+        image_token = next(t for t in texts if t.startswith("[image:"))
+        fingerprint = image_token.removeprefix("[image:").removesuffix("]")
+        assert len(fingerprint) == 64
+        int(fingerprint, 16)  # hex
+
+    def test_same_url_same_fingerprint(self):
+        from context_proxy.context.candidates import content_texts
+
+        assert content_texts(multimodal_message("d", DATA_URL)) == content_texts(
+            multimodal_message("d", DATA_URL)
+        )
+
+    def test_different_url_different_fingerprint(self):
+        from context_proxy.context.candidates import content_texts
+
+        one = content_texts(multimodal_message("d", DATA_URL))
+        two = content_texts(multimodal_message("d", DATA_URL + "x"))
+        assert one != two
+
+
+class TestUnknownPartIdentity:
+    """Unknown parts carry payload-derived distinct identities (review §3)."""
+
+    def test_same_payload_same_identity_regardless_of_key_order(self):
+        from context_proxy.context.candidates import content_texts
+
+        part_a = {"type": "custom_part", "payload": "A", "meta": 1}
+        part_b = {"meta": 1, "payload": "A", "type": "custom_part"}
+        one = {
+            "role": "user",
+            "content": [{"type": "text", "text": "t"}, part_a],
+        }
+        two = {
+            "role": "user",
+            "content": [{"type": "text", "text": "t"}, part_b],
+        }
+        assert content_texts(one) == content_texts(two)
+
+    def test_different_payload_different_identity(self):
+        from context_proxy.context.candidates import content_texts
+
+        one = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "t"},
+                {"type": "custom_part", "payload": "A"},
+            ],
+        }
+        two = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "t"},
+                {"type": "custom_part", "payload": "B"},
+            ],
+        }
+        assert content_texts(one) != content_texts(two)
+
+    def test_raw_payload_never_enters_canonical_text(self):
+        from context_proxy.context.candidates import message_texts
+
+        secret_payload = {"type": "custom_part", "payload": "SUPER-RAW-VALUE-123"}
+        text = message_texts(
+            [{"role": "user", "content": [{"type": "text", "text": "x"}, secret_payload]}]
+        )
+        assert "SUPER-RAW-VALUE-123" not in text
+
+
+class TestMultimodalToolInteractionEndToEnd:
+    """Combined M3/M4/M6 regression (review §4)."""
+
+    @staticmethod
+    def _unit(text: str, url: str, arguments: str) -> list[dict[str, Any]]:
+        return [
+            multimodal_message(text, url),
+            _tool_call("inspect_screenshot", arguments),
+            {"role": "tool", "tool_call_id": "call_inspect_screenshot",
+             "content": "pixels analyzed"},
+            {"role": "assistant", "content": "final answer"},
+        ]
+
+    URL_A = "data:image/png;base64,AAAAAAAA"
+    URL_B = "data:image/png;base64,BBBBBBBB"
+
+    def test_unit_stays_atomic_and_identity_components_contribute(self):
+        from context_proxy.config import AssemblySettings, RetrievalSettings
+        from context_proxy.context.engine import (
+            ContextAssemblyEngine,
+            separate_current_request,
+        )
+
+        unit = self._unit("look", self.URL_A, '{"zoom":2}')
+        history = [*unit, {"role": "user", "content": "next"}]
+        history_msgs, current = separate_current_request(history)
+
+        plan = ContextAssemblyEngine(
+            usable_budget=50_000,
+            settings=AssemblySettings(),
+            retrieval_settings=RetrievalSettings(),
+        ).build(history=history_msgs, current_request=current)
+
+        # 1. atomicity: all four roles present, image verbatim upstream
+        roles = [m["role"] for m in plan.messages[:4]]
+        assert roles == ["user", "assistant", "tool", "assistant"]
+        assert plan.messages[0]["content"][1]["image_url"]["url"] == self.URL_A
+        # 5. no erroneous dedup inside the assembled request
+        blob = json.dumps(plan.messages)
+        assert blob.count("pixels analyzed") == 1
+
+    def test_image_change_changes_identity(self):
+        from context_proxy.context.candidates import (
+            canonical_text,
+            message_texts,
+        )
+
+        a = canonical_text(message_texts(self._unit("look", self.URL_A, '{"zoom":2}')))
+        b = canonical_text(message_texts(self._unit("look", self.URL_B, '{"zoom":2}')))
+        assert a != b  # identity A != B
+
+    def test_tool_argument_change_changes_identity(self):
+        from context_proxy.context.candidates import (
+            canonical_text,
+            message_texts,
+        )
+
+        a = canonical_text(message_texts(self._unit("look", self.URL_A, '{"zoom":2}')))
+        c = canonical_text(message_texts(self._unit("look", self.URL_A, '{"zoom":4}')))
+        assert a != c  # identity A != C

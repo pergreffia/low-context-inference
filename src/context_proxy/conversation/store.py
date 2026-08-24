@@ -270,7 +270,7 @@ class PostgresConversationStore:
                 """
                 INSERT INTO conversation_media
                     (conversation_id, message_id, part_index, kind,
-                     source, media_hash, byte_size)
+                     source, media_hash, source_size)
                 VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (message_id, part_index) DO NOTHING
                 """,

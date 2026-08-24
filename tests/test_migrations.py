@@ -48,6 +48,7 @@ def test_migrations_idempotent_and_schema_present():
         "0007_chunk_end_seq.sql",
         "0008_chunk_span_not_null.sql",
         "0009_conversation_media.sql",
+        "0010_media_source_size.sql",
     } <= applied | set(first)
     assert second == []  # never reapplied within a single process
     expected = {
@@ -195,6 +196,7 @@ def test_concurrent_startup_applies_each_exactly_once():
         pool_b = await asyncpg.create_pool(dsn=MIGRATION_DSN)
         try:
             for table in (
+                "conversation_media",
                 "summaries",
                 "memory_records",
                 "conversation_chunks",
@@ -222,6 +224,7 @@ def test_concurrent_startup_applies_each_exactly_once():
                 "0007_chunk_end_seq.sql",
                 "0008_chunk_span_not_null.sql",
                 "0009_conversation_media.sql",
+                "0010_media_source_size.sql",
             }
             # every migration applied exactly once across both runners
             assert len(names) == len(set(names))
@@ -255,6 +258,7 @@ def test_migrations_from_clean_database_create_full_m3_schema():
         pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
         try:
             for table in (
+                "conversation_media",
                 "summaries",
                 "memory_records",
                 "conversation_chunks",
@@ -267,7 +271,7 @@ def test_migrations_from_clean_database_create_full_m3_schema():
                 await pool.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
 
             completed = await apply_migrations(pool)
-            assert len(completed) == 9
+            assert len(completed) == 10
 
             cols = await pool.fetch(
                 """
