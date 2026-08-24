@@ -700,3 +700,167 @@ class TestDeepToolValidation:
 
 
 DATA_URL_SHORT = "data:image/png;base64,AA=="
+
+
+class TestRetrievedOrderingInvariant:
+    """Retrieved blocks pack BEFORE the current request (post-review P1)."""
+
+    class StubMemory:
+        def __init__(self, items):
+            self._items = items
+
+        async def retrieve(self, query, conversation_id, limit=None):
+            return self._items
+
+        async def index_completed_turns(self, conversation_id):
+            return 0
+
+    def test_retrieved_blocks_precede_final_user_turn(self, captured_requests):
+        retrieved_items = [
+            memory_item("mem-1", "older memory one", semantic=0.9),
+            memory_item("mem-2", "older memory two", semantic=0.8),
+        ]
+        body = {
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "CURRENT LIVE REQUEST"},
+            ],
+        }
+        headers = {"X-Conversation-ID": CONV_A}
+        memory = self.StubMemory(retrieved_items)
+        with run_client(
+            build_client(captured_requests, settings_overrides=None, memory=memory)
+        ) as client:
+            response = client.post("/v1/chat/completions", json=body, headers=headers)
+        assert response.status_code == 200
+        sent = json.loads(captured_requests[-1].content)["messages"]
+
+        user_indices = [
+            i for i, m in enumerate(sent) if m.get("role") == "user"
+        ]
+        # 4/6: every retrieved block is role=user...
+        retrieved_blocks = [
+            m for m in sent
+            if isinstance(m.get("content"), str)
+            and m["content"].startswith("[retrieved ")
+        ]
+        assert len(retrieved_blocks) == 2
+        assert all(m["role"] == "user" for m in retrieved_blocks)
+
+        # 5: they occur BEFORE the final user turn
+        final_user_index = max(i for i, m in enumerate(sent) if m.get("role") == "user")
+        for block in retrieved_blocks:
+            assert sent.index(block) < final_user_index
+        assert user_indices[-1] == final_user_index
+
+        # 6: the FINAL user message is the actual current request, byte-exact
+        assert sent[final_user_index]["content"] == "CURRENT LIVE REQUEST"
+        # ...and the raw current request text is not the retrieved payload
+        assert "older memory" not in sent[final_user_index]["content"]
+
+        # 7: retrieved content byte-for-byte intact inside its own block
+        assert "older memory one" in retrieved_blocks[0]["content"]
+        assert "older memory two" in retrieved_blocks[1]["content"]
+
+
+class TestStringContentPartsRejected:
+    @pytest.mark.parametrize(
+        "parts",
+        [["hello"], [123], [None]],
+    )
+    def test_non_object_parts_are_client_errors(self, captured_requests, parts):
+        body = {
+            "model": "m",
+            "messages": [{"role": "user", "content": parts}],
+        }
+        with run_client(build_client(captured_requests)) as client:
+            response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_request_error"
+
+    def test_object_parts_still_accepted_including_unknown_types(
+        self, captured_requests
+    ):
+        body = {
+            "model": "m",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hi"},
+                        {"type": "image_url",
+                         "image_url": {"url": "data:image/png;base64,AA=="}},
+                        {"type": "future_custom_type", "payload": [1, 2]},
+                    ],
+                }
+            ],
+        }
+        with run_client(build_client(captured_requests)) as client:
+            response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200
+
+
+class TestNoLockDuringInference:
+    """Instrumented proof of `lock → reconcile → unlock → inference` order."""
+
+    def test_inference_never_inside_reconcile_window(self, captured_requests):
+        events: list[tuple[str, float]] = []
+        import time
+
+        class InstrumentedStore:
+            async def ensure_conversation(self, conversation_id):
+                return None
+
+            async def reconcile_history(
+                self, conversation_id, messages, metadata=None
+            ):
+                events.append(("lock_start", time.monotonic()))
+                await asyncio.sleep(0)  # simulate DB round-trip
+                events.append(("lock_end", time.monotonic()))
+                return []
+
+        def upstream_handler_with_marker(request: httpx.Request) -> httpx.Response:
+            events.append(("inference", time.monotonic()))
+            return httpx.Response(200, json={
+                "id": "x", "object": "chat.completion", "model": "m",
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": "ok"},
+                             "finish_reason": "stop"}],
+            })
+
+        settings = make_settings()
+        app = create_app(
+            settings,
+            llm_client=httpx.AsyncClient(
+                base_url=UPSTREAM,
+                transport=httpx.MockTransport(upstream_handler_with_marker),
+            ),
+            store=InstrumentedStore(),
+        )
+        with TestClient(app) as client:
+            response = client.post("/v1/chat/completions", json=CHAT_OK)
+        assert response.status_code == 200
+
+        locks = [
+            (start, end) for _, start, end in _pair_lock_events(events)
+        ]
+        inference_times = [t for name, t in events if name == "inference"]
+        assert inference_times, "inference must have been invoked"
+        for call_time in inference_times:
+            for lock_start, lock_end in locks:
+                assert not (lock_start <= call_time <= lock_end), (
+                    "inference ran inside a reconciliation lock window"
+                )
+
+
+def _pair_lock_events(events):
+    start = None
+    for name, ts in events:
+        if name == "lock_start":
+            start = ts
+        elif name == "lock_end" and start is not None:
+            yield ("window", start, ts)
+            start = None

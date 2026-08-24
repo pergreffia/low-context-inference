@@ -253,7 +253,8 @@ class DroppedCandidate:
 def candidate_from_retrieved(item: RetrievedItem, counter: TokenCounter) -> Candidate:
     """Project a RetrievedItem into a retrieval Candidate.
 
-    The rendered message is one system block; token cost is computed from its
+    The rendered message is one untrusted user-role block carrying a
+    provenance header (`[retrieved …]`); token cost is computed from its
     exact rendered form so budget accounting matches what is sent upstream.
     Supersession enforcement lives upstream of this projection: the memory
     service only returns active records (PostgreSQL status filter) and the
@@ -270,6 +271,10 @@ def candidate_from_retrieved(item: RetrievedItem, counter: TokenCounter) -> Cand
     mistaken for a trusted system instruction regardless of its content
     (delimiters alone are not a security boundary and are not used as one).
     Raw retrieved text is preserved verbatim.
+
+    Ordering invariant (post-024d014 review): retrieved blocks always pack
+    BEFORE the current request, so the final user turn the model sees is the
+    actual live request — never a retrieved block.
     """
     label = f"[retrieved {item.item_type}:{item.kind} id={item.id}]"
     content = f"{label}\n{item.content}"

@@ -113,9 +113,11 @@ def _validate_message(message: Any, index: int) -> None:
             raise _reject(f"{where}.content must be a string, array, or null")
         if isinstance(content, list):
             for part_index, part in enumerate(content):
-                # Parts themselves stay opaque (M6): only their container type
-                # is checked — anything dict-like passes through.
-                if part is not None and not isinstance(part, (dict, str)):
+                # Array parts MUST be objects (M6 final review P2): string or
+                # scalar elements would silently vanish from multimodal
+                # canonicalization. Object parts stay opaque (unknown types
+                # and fields pass through untouched).
+                if not isinstance(part, dict):
                     raise _reject(
                         f"{where}.content[{part_index}] must be an object"
                     )
