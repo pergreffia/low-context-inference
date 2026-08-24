@@ -40,12 +40,63 @@ def validate_chat_payload(payload: dict[str, Any]) -> None:
         _validate_message(message, index)
 
     tools = payload.get("tools")
-    if tools is not None and not isinstance(tools, list):
-        raise _reject("'tools' must be an array when present")
+    if tools is not None:
+        if not isinstance(tools, list):
+            raise _reject("'tools' must be an array when present")
+        for index, tool in enumerate(tools):
+            _validate_tool(tool, f"tools[{index}]")
 
     stream = payload.get("stream")
     if stream is not None and not isinstance(stream, bool):
         raise _reject("'stream' must be a boolean when present")
+
+
+def _validate_tool(tool: Any, where: str) -> None:
+    """Shape-only checks for tool definitions the proxy relies on."""
+    if not isinstance(tool, dict):
+        raise _reject(f"{where} must be an object")
+    tool_type = tool.get("type")
+    if not isinstance(tool_type, str) or not tool_type:
+        raise _reject(f"{where}.type must be a non-empty string")
+    if tool_type != "function":
+        return  # unknown future tool types stay structurally opaque
+    function = tool.get("function")
+    if not isinstance(function, dict):
+        raise _reject(f"{where}.function must be an object for function tools")
+    name = function.get("name")
+    if not isinstance(name, str) or not name:
+        raise _reject(f"{where}.function.name must be a non-empty string")
+    description = function.get("description")
+    if description is not None and not isinstance(description, str):
+        raise _reject(f"{where}.function.description must be a string when present")
+    parameters = function.get("parameters")
+    # JSON Schema contents are NOT validated — only the container shape.
+    if parameters is not None and not isinstance(parameters, dict):
+        raise _reject(f"{where}.function.parameters must be an object when present")
+
+
+def _validate_tool_calls(tool_calls: Any, where: str) -> None:
+    """Shape-only checks for assistant message tool_calls (final review P2)."""
+    for index, call in enumerate(tool_calls):
+        call_where = f"{where}[{index}]"
+        if not isinstance(call, dict):
+            raise _reject(f"{call_where} must be an object")
+        call_id = call.get("id")
+        if call_id is not None and not isinstance(call_id, str):
+            raise _reject(f"{call_where}.id must be a string when present")
+        function = call.get("function")
+        if function is None:
+            raise _reject(f"{call_where}.function is required")
+        if not isinstance(function, dict):
+            raise _reject(f"{call_where}.function must be an object")
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            raise _reject(f"{call_where}.function.name must be a non-empty string")
+        arguments = function.get("arguments")
+        if arguments is not None and not isinstance(arguments, str):
+            raise _reject(
+                f"{call_where}.function.arguments must be a string when present"
+            )
 
 
 def _validate_message(message: Any, index: int) -> None:
@@ -70,5 +121,7 @@ def _validate_message(message: Any, index: int) -> None:
                     )
 
     tool_calls = message.get("tool_calls")
-    if tool_calls is not None and not isinstance(tool_calls, list):
-        raise _reject(f"{where}.tool_calls must be an array when present")
+    if tool_calls is not None:
+        if not isinstance(tool_calls, list):
+            raise _reject(f"{where}.tool_calls must be an array when present")
+        _validate_tool_calls(tool_calls, where)

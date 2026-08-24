@@ -263,18 +263,17 @@ def candidate_from_retrieved(item: RetrievedItem, counter: TokenCounter) -> Cand
     (conversation_id + start_seq/end_seq); memories carry a stable content
     fingerprint. Identical content is NOT identical authoritative history —
     raw interactions are only ever matched through their stored spans.
-    Trust boundary (M0–M6 review P1): retrieved blocks are DERIVED, untrusted
-    data. They render as system-role messages but wrapped in explicit
-    <retrieved_context> delimiters so user-controlled text can never pose as
-    trusted instructions.
+    Trust boundary (final review P1): retrieved blocks are DERIVED, untrusted
+    data derived from user-controlled content. They render as **user-role**
+    messages with a provenance header line: every provider treats user
+    content as untrusted by definition, so retrieved text can never be
+    mistaken for a trusted system instruction regardless of its content
+    (delimiters alone are not a security boundary and are not used as one).
+    Raw retrieved text is preserved verbatim.
     """
     label = f"[retrieved {item.item_type}:{item.kind} id={item.id}]"
-    content = (
-        "<retrieved_context>\n"
-        f"{label}\n{item.content}\n"
-        "</retrieved_context>"
-    )
-    message = {"role": "system", "content": content}
+    content = f"{label}\n{item.content}"
+    message = {"role": "user", "content": content}
     source = (
         CandidateSource.MEMORY if item.item_type == "memory" else CandidateSource.CHUNK
     )

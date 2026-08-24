@@ -514,15 +514,13 @@ class ContextAssemblyEngine:
                 candidate.classification == CandidateClassification.DERIVED_CONTEXT
                 and candidate.render
                 and candidate.render[0].get("role") == "system"
-                and "<retrieved_context>" not in str(
-                    candidate.render[0].get("content") or ""
-                )
             ):
-                # Structural guard against future regressions: derived data
-                # must never pose as a bare trusted system instruction.
+                # Structural trust-boundary guard (final review P1): retrieved
+                # user-controlled data must NEVER render as a trusted system
+                # instruction — delimiters alone are not a boundary.
                 raise RuntimeError(
-                    f"derived candidate {candidate.key!r} rendered as an "
-                    "undelimited system instruction"
+                    f"derived candidate {candidate.key!r} rendered as a "
+                    "trusted system instruction"
                 )
             messages.extend(candidate.render)
             token_estimate += candidate.tokens
