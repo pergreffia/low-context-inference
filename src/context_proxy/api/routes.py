@@ -13,6 +13,7 @@ from context_proxy.api.responses import (
     streaming_response,
     upstream_response,
 )
+from context_proxy.api.validation import validate_chat_payload
 from context_proxy.capture import PersistingLLMStream
 from context_proxy.context.engine import (
     ContextOverflowError as EngineOverflowError,
@@ -66,6 +67,7 @@ async def chat_completions(request: Request):
 
     try:
         payload = await parse_json_body(request)
+        validate_chat_payload(payload)
     except ValueError as exc:
         return openai_error(
             str(exc),

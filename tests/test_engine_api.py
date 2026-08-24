@@ -110,7 +110,10 @@ class TestEnginePath:
         contents = [
             m.get("content") for m in upstream_payload(captured_requests)["messages"]
         ]
-        assert any("PostgreSQL 16" in c and "[memory:fact mem-9]" in c for c in contents)
+        assert any(
+            "PostgreSQL 16" in c and "[retrieved memory:fact id=mem-9]" in c
+            for c in contents
+        )
         assert contents[0] == "be terse"
         assert contents[-1] == "what storage do we use?"
 
@@ -134,7 +137,7 @@ class TestEnginePath:
                 assert response.headers["x-conversation-id"] == CONV_A
         payload = upstream_payload(captured_requests)
         assert payload["stream"] is True
-        assert "[memory:fact m]" in json.dumps(payload["messages"])
+        assert "[retrieved memory:fact id=m]" in json.dumps(payload["messages"])
 
     def test_no_memory_service_still_completes(self, captured_requests):
         with run_client(build_client(captured_requests)) as client:

@@ -11,7 +11,7 @@ import pytest
 
 from context_proxy.config import EndpointSettings, RetrievalSettings
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
-from context_proxy.memory.errors import VectorStoreError
+from context_proxy.memory.errors import EmbeddingProviderError, VectorStoreError
 from context_proxy.memory.models import MemoryCreate, MemoryKind
 from context_proxy.memory.qdrant import QdrantVectorStore
 from context_proxy.memory.service import MemoryService
@@ -276,7 +276,7 @@ def test_degraded_vector_leg_still_returns_lexical_only():
 
             class BrokenEmbedder(HashingEmbedder):
                 async def embed(self, texts):
-                    raise RuntimeError("embedding endpoint down")
+                    raise EmbeddingProviderError("embedding endpoint down")
 
             broken = MemoryService(
                 pool,
@@ -747,7 +747,7 @@ class InstrumentedEmbedder(HashingEmbedder):
         if self._sleep:
             await asyncio.sleep(self._sleep)
         if self.calls <= self._fail_times:
-            raise RuntimeError("embedding outage")
+            raise EmbeddingProviderError("embedding outage")
         return await super().embed(texts)
 
 
@@ -765,7 +765,7 @@ class CountingVectorStore(RecordingVectorStore):
         for p in points:
             self.per_point[p["id"]] = self.per_point.get(p["id"], 0) + 1
         if self.upsert_calls <= self._fail_times:
-            raise RuntimeError("qdrant outage")
+            raise VectorStoreError("qdrant outage")
         await super().upsert(points, vector_size)
 
 

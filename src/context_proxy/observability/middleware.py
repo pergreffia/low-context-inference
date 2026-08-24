@@ -116,12 +116,38 @@ class ObservabilityMiddleware:
         state = scope.setdefault("state", {})
         state.setdefault("stages", {})
         route = normalize_route(scope.get("path", ""))
-        responded = False
+        # Single completion-accounting record per request (M0–M6 review P2):
+        # every path — normal, 4xx, 413/429 rejects, exceptions — converges
+        # here exactly once.
+        accounted = {"done": False}
+
+        def finish(status_code: int) -> None:
+            if accounted["done"]:
+                return
+            accounted["done"] = True
+            duration = time.monotonic() - started
+            HTTP_REQUESTS_TOTAL.labels(
+                method=scope["method"], route=route, status=str(status_code)
+            ).inc()
+            HTTP_REQUEST_DURATION.labels(route=route).observe(duration)
+            stages = state.get("stages") or {}
+            logger.log(
+                logging.INFO,
+                "request_failed" if status_code == 500 else "request_completed",
+                extra={
+                    "route": route,
+                    "status": status_code,
+                    "duration_seconds": round(duration, 6),
+                    **{
+                        f"stage_{k}_seconds": round(v, 6)
+                        for k, v in sorted(stages.items())
+                    },
+                },
+                exc_info=(status_code == 500),
+            )
 
         async def send_wrapper(message) -> None:
-            nonlocal responded
             if message["type"] == "http.response.start":
-                responded = True
                 state["response_status"] = message["status"]
                 headers = list(message.get("headers") or [])
                 names = {name.decode("latin-1").lower() for name, _ in headers}
@@ -148,7 +174,6 @@ class ObservabilityMiddleware:
                 and content_length.isdigit()
                 and int(content_length) > self._max_body_bytes
             ):
-                HTTP_REQUESTS_TOTAL.labels(method=scope["method"], route=route, status="413").inc()
                 logger.warning("request_too_large", extra={"route": route})
                 await reject(413, "request_too_large",
                              f"request body exceeds {self._max_body_bytes} bytes")
@@ -159,9 +184,6 @@ class ObservabilityMiddleware:
                 if not self._limiter.allow(key):
                     RATE_LIMIT_REJECTS_TOTAL.inc()
                     retry_after = str(self._limiter.retry_after(key))
-                    HTTP_REQUESTS_TOTAL.labels(
-                        method=scope["method"], route=route, status="429"
-                    ).inc()
                     logger.warning(
                         "rate_limited", extra={"route": route, "retry_after": retry_after}
                     )
@@ -176,9 +198,6 @@ class ObservabilityMiddleware:
                 # enforcement happens BEFORE the app reads anything.
                 messages, outcome = await _drain_body(receive, self._max_body_bytes)
                 if outcome == "oversized":
-                    HTTP_REQUESTS_TOTAL.labels(
-                        method=scope["method"], route=route, status="413"
-                    ).inc()
                     logger.warning("request_too_large", extra={"route": route})
                     await reject(413, "request_too_large",
                                  f"request body exceeds {self._max_body_bytes} bytes")
@@ -186,42 +205,24 @@ class ObservabilityMiddleware:
                 if outcome == "disconnected":
                     # Client vanished mid-upload: never reach the application,
                     # never fabricate a normal end-of-body on its behalf.
-                    # (Context var is restored by the finally below.)
+                    state["response_status"] = 499  # client-closed-request
                     logger.info(
                         "client_disconnected_during_body", extra={"route": route}
                     )
                     return
                 receive = _replaying_receive(messages, receive)
-            await self.app(scope, receive, send_wrapper)
+            try:
+                await self.app(scope, receive, send_wrapper)
+            except Exception:
+                state["response_status"] = 500
+                raise
         except Exception:
-            duration = time.monotonic() - started
-            HTTP_REQUESTS_TOTAL.labels(
-                method=scope["method"], route=route, status="500"
-            ).inc()
-            HTTP_REQUEST_DURATION.labels(route=route).observe(duration)
-            logger.exception(
-                "request_failed",
-                extra={"route": route, "duration_seconds": round(duration, 6)},
-            )
             raise
         finally:
+            # Single completion-accounting record for EVERY path (review P2):
+            # normal, 4xx validation, 413/429 rejects, disconnect, 500.
+            finish(int(state.get("response_status", 500)))
             REQUEST_ID_CTX.reset(token)
-
-        duration = time.monotonic() - started
-        status_code = state.get("response_status", 200)
-        status = str(status_code)
-        HTTP_REQUESTS_TOTAL.labels(method=scope["method"], route=route, status=status).inc()
-        HTTP_REQUEST_DURATION.labels(route=route).observe(duration)
-        stages = state.get("stages") or {}
-        logger.info(
-            "request_completed",
-            extra={
-                "route": route,
-                "status": status_code,
-                "duration_seconds": round(duration, 6),
-                **{f"stage_{k}_seconds": round(v, 6) for k, v in sorted(stages.items())},
-            },
-        )
 
 
 def record_stage(request, name: str, started_monotonic: float) -> None:

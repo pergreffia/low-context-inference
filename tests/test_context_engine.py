@@ -163,11 +163,11 @@ class TestSeparateBoundaries:
         assert separate_current_request([]) == ([], [])
 
     def test_system_only(self):
-        # Established interaction-unit contract: the trailing unit is the live
-        # interaction. A lone system message therefore IS the trailing unit.
+        # No user-initiated interaction exists: the lone system message is
+        # history/system context, current request is empty.
         history, current = separate_current_request([{"role": "system", "content": "s"}])
-        assert history == []
-        assert current == [{"role": "system", "content": "s"}]
+        assert history == [{"role": "system", "content": "s"}]
+        assert current == []
 
     def test_system_plus_user(self):
         messages = [
@@ -642,7 +642,9 @@ class TestBudget:
             retrieved=[memory_item("m1", "retrieved knowledge")],
         )
         contents = [m.get("content") for m in plan.messages]
-        mem_index = next(i for i, c in enumerate(contents) if "[memory:fact m1]" in c)
+        mem_index = next(
+            i for i, c in enumerate(contents) if "[retrieved memory:fact id=m1]" in c
+        )
         assert contents.index("sys") < mem_index < contents.index("old turn")
 
 
@@ -721,3 +723,40 @@ class TestAtomicity:
         except ContextOverflowError:
             return
         assert_whole_units(plan.messages, all_units)
+
+
+class TestRobustCurrentRequestDetection:
+    """Current request = last USER-initiated interaction (review P3)."""
+
+    def test_trailing_system_after_assistant(self):
+        messages = [
+            {"role": "system", "content": "s0"},
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+            {"role": "system", "content": "s1"},
+        ]
+        history, current = separate_current_request(messages)
+        assert current == [{"role": "user", "content": "q"},
+                           {"role": "assistant", "content": "a"}]
+        assert history[0] == {"role": "system", "content": "s0"}
+        assert history[-1] == {"role": "system", "content": "s1"}
+        # same message multiset, systems normalized into history position
+        assert len(history) + len(current) == len(messages)
+        assert {json.dumps(m, sort_keys=True) for m in history + current} == {
+            json.dumps(m, sort_keys=True) for m in messages
+        }
+
+    def test_tool_unit_before_trailing_user(self):
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c", "content": "r"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "final question"},
+        ]
+        _, current = separate_current_request(messages)
+        assert current == [{"role": "user", "content": "final question"}]
+

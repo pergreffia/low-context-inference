@@ -5,6 +5,7 @@ No arbitrary dicts cross the internal API boundary.
 
 from __future__ import annotations
 
+import uuid
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -50,7 +51,9 @@ class MemoryCreate(BaseModel):
     kind: MemoryKind
     content: str = Field(min_length=1)
     conversation_id: str
-    source_message_ids: list[str] = Field(default_factory=list)
+    # UUID-typed: malformed ids are rejected at the API boundary (422) instead
+    # of reaching PostgreSQL as low-level array cast errors.
+    source_message_ids: list[uuid.UUID] = Field(default_factory=list)
     importance: float = Field(default=0.0, ge=0.0, le=1.0)
     supersedes: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

@@ -10,7 +10,7 @@ M5 hardening plus first-class multimodal support, primary use case: screenshots 
 
 - **Content transparency**: `content` may be a string or an array of parts (`text`, `image_url`, `data:` URLs). Parts pass through `client → persistence → context selection → provider` untouched — arrays are never stringified and unknown part types stay opaque instead of being discarded.
 - **Token accounting**: text parts counted as text; image parts use a flat deterministic estimate (`IMAGE_PART_TOKENS = 1024`) so base64 payloads never inflate the budget; unknown parts a flat placeholder.
-- **Persistence**: raw content stays verbatim in `messages.jsonb` — the provider request is always reconstructable exactly, images included. A `conversation_media` registry (migration `0009`) indexes each image part against its message/interaction unit (`source: data|url`, hash, size) for diagnostics and future retrieval.
+- **Persistence**: raw content stays verbatim in `messages.jsonb` — the provider request is always reconstructable exactly, images included. A `conversation_media` registry (migration `0009`) indexes each image part against its message/interaction unit (`source: data|url`, hash, `source_size`); `source_size` is the length of the source reference string as sent by the client — **not** the decoded media size, and remote media is never fetched.
 - **Interaction atomicity**: `user(text+image) + assistant` is one indivisible unit in the Context Assembly Engine; budget pressure drops it whole, never text-only. Identity fingerprints distinguish same-text/different-image interactions.
 - **Retrieval queries**: only textual parts feed lexical/semantic retrieval; images never leak into query strings.
 
@@ -52,6 +52,7 @@ candidate fusion → deduplication → supersession filtering
 - **Category precedence under budget pressure**: system + tools > pinned > current request > recent turns (newest-first, one contiguous window) > retrieved blocks (MMR order). Recent raw truth outranks derived memories by design.
 - **Deduplication without touching raw state**: a memory restating a recent turn, or a chunk whose stored JSON-lines match the live window, is dropped from the *assembled request only*; persisted history is never rewritten. Identical messages legitimately repeated in raw history survive (no content-based dedup of authoritative data). Candidate identity: chunks carry their authoritative `conversation_id + start_seq/end_seq` span (migration `0007_chunk_end_seq`), memories carry a stable content fingerprint.
 - **Supersession + isolation defense-in-depth**: PostgreSQL already returns active-only records; the engine additionally rejects any superseded id passed by the caller and any retrieval block whose `conversation_id` differs from the request's.
+- **Trust boundary**: retrieved memories/chunks are **derived, untrusted context** — rendered as delimited `<retrieved_context>` blocks (classification enforced structurally in the engine), never as bare trusted system instructions.
 - **Deterministic scoring & MMR**: weighted components (semantic/lexical/recency/importance/type — same weights as hybrid retrieval), greedy MMR with `ASSEMBLY__MMR_LAMBDA`, ties always broken by stable key. Identical inputs produce byte-identical plans.
 - **Budget guarantees**: the final context never exceeds `usable = model_limit − safety_margin`; tool definitions consume budget; if system + tools + pinned + current request alone cannot fit, the proxy answers OpenAI `context_length_exceeded` (HTTP 400) before any inference call.
 - **Diagnostics**: every plan records selected/dropped items with reasons (`duplicate`, `superseded`, `foreign_conversation`, `budget`, `not_selected`), category token accounting, and weights. `POST /internal/v1/conversations/{id}/context/preview` returns a read-only debug view (ids/scores/reasons only, no raw content) scoped to one conversation.
@@ -106,7 +107,7 @@ uvicorn context_proxy.main:app --host 0.0.0.0 --port 8080
 
 ### Qdrant
 
-Qdrant is defined in Docker Compose as infrastructure reserved for later milestones (vector retrieval, M3). It is **not** a runtime dependency of `context-proxy` in M1: the proxy starts and runs without it. It becomes a runtime dependency when vector retrieval is implemented.
+Qdrant is a **live dependency of the memory service since M3** (hybrid retrieval, M4 context assembly, M6 rebuild endpoint). Inside Docker Compose it is reachable via the service name (`QDRANT__BASE_URL=http://qdrant:6333` — `localhost` inside the proxy container points at the proxy itself). Outside Compose, run it on the configured host; the proxy still starts if it is unreachable, degrading to lexical-only retrieval.
 
 ## Model selection
 

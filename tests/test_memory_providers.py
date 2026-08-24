@@ -5,6 +5,7 @@ import pytest
 
 from context_proxy.config import EndpointSettings
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
+from context_proxy.memory.errors import EmbeddingProviderError
 from context_proxy.memory.qdrant import QdrantVectorStore
 
 
@@ -58,8 +59,10 @@ async def test_embed_error_propagates_for_degradation_handling():
             transport=httpx.MockTransport(handler),
         ),
     )
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(EmbeddingProviderError) as excinfo:
         await provider.embed(["x"])
+    # expected provider failure keeps its cause chain for diagnostics
+    assert isinstance(excinfo.value.__cause__, httpx.HTTPStatusError)
 
 
 def test_qdrant_upsert_bootstraps_collection_and_filters_search():

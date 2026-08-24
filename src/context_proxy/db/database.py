@@ -83,6 +83,13 @@ class Database:
         return self._pool is not None
 
     async def start(self) -> bool:
+        """Create the pool and apply migrations.
+
+        Unreachable PostgreSQL degrades gracefully (returns False, §31). A
+        pool that was created but FAILED to migrate is closed and the error
+        re-raised: serving traffic on an unverified schema would be worse
+        than failing startup (M0–M6 review P2).
+        """
         try:
             self._pool = await asyncpg.create_pool(
                 dsn=self._settings.url,
@@ -90,11 +97,17 @@ class Database:
                 max_size=self._settings.max_pool_size,
                 timeout=self._settings.connect_timeout_seconds,
             )
-            await apply_migrations(self._pool)
         except Exception as exc:  # noqa: BLE001 - degradation is intentional (§31)
             logger.warning("postgres_unavailable", extra={"error": str(exc)})
             self._pool = None
             return False
+        try:
+            await apply_migrations(self._pool)
+        except Exception as exc:
+            await self._pool.close()
+            self._pool = None
+            logger.error("migration_failed", extra={"error": str(exc)})
+            raise
         return True
 
     async def close(self) -> None:

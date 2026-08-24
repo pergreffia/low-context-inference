@@ -4,14 +4,20 @@ services:
     env_file: .env
     environment:
       DATABASE__URL: postgresql://${POSTGRES_USER:-context_proxy}:${POSTGRES_PASSWORD:-context_proxy}@postgres:5432/${POSTGRES_DB:-context_proxy}
+      # M3+: Qdrant is a live dependency of the memory service. Inside the
+      # Compose network it is reachable ONLY via the service name below;
+      # localhost would point at the proxy container itself.
+      QDRANT__BASE_URL: http://qdrant:6333
+      # INFERENCE__BASE_URL / EMBEDDINGS__BASE_URL are EXTERNAL services by
+      # default (localhost on the host). When running them inside Compose,
+      # override with their service names here.
     ports:
       - "${SERVER__PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
-    # Qdrant is infrastructure reserved for later milestones (vector retrieval,
-    # M3). It is NOT a runtime dependency of context-proxy in M1: proxy startup
-    # must not fail when it is unavailable.
+      qdrant:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
@@ -50,8 +56,8 @@ services:
       timeout: 5s
       retries: 5
 
-  # M3/M4: memory-service, embedding-service, compact-service join here.
-
+  # M5: memory-service, embedding-service join here as needed; when added,
+  # point EMBEDDINGS__BASE_URL at their service names.
 volumes:
   pgdata:
   qdrant_storage:

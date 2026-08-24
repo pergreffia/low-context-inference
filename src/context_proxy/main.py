@@ -38,6 +38,9 @@ def create_app(
     settings = settings or load_settings()
     database = database or Database(settings.database)
     owned_clients: list[httpx.AsyncClient] = []
+    # Ownership rule (§17): only clients the application creates are closed
+    # on shutdown. An injected llm_client belongs to the caller.
+    owned_llm_client = llm_client is None
     breaker = CircuitBreaker(
         failure_threshold=settings.resilience.breaker_failure_threshold,
         reset_seconds=settings.resilience.breaker_reset_seconds,
@@ -102,6 +105,11 @@ def create_app(
         yield
         # Graceful shutdown (§17): each owned resource is closed in isolation —
         # one cleanup failure must not prevent the others from being released.
+        if owned_llm_client:
+            try:
+                await app.state.llm.aclose()
+            except Exception as exc:  # noqa: BLE001 - isolation is the point
+                logger.warning("inference_client_close_failed", extra={"error": str(exc)})
         for client in owned_clients:
             try:
                 await client.aclose()
@@ -114,6 +122,14 @@ def create_app(
 
     app = FastAPI(title="Context Proxy", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
+    if llm_client is None:
+        # Application-owned inference client: closed on shutdown (M6 review).
+        llm_client = httpx.AsyncClient(
+            base_url=settings.inference.base_url,
+            timeout=httpx.Timeout(settings.inference.timeout_seconds),
+        )
+        if settings.inference.api_key:
+            llm_client.headers["Authorization"] = f"Bearer {settings.inference.api_key}"
     app.state.llm = OpenAICompatibleLLMProvider(
         settings.inference,
         client=llm_client,

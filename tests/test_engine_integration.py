@@ -18,7 +18,7 @@ from context_proxy.config import AssemblySettings, EndpointSettings, RetrievalSe
 from context_proxy.context.engine import ContextAssemblyEngine, separate_current_request
 from context_proxy.conversation.store import PostgresConversationStore
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
-from context_proxy.memory.errors import RetrievalError
+from context_proxy.memory.errors import EmbeddingProviderError, RetrievalError
 from context_proxy.memory.models import MemoryCreate, MemoryKind
 from context_proxy.memory.qdrant import QdrantVectorStore
 from context_proxy.memory.service import MemoryService
@@ -260,7 +260,7 @@ def test_lexical_fallback_feeds_engine_when_semantic_leg_down():
             # Vector leg unavailable: embedding provider raises.
             class BrokenEmbedder(HashingEmbedder):
                 async def embed(self, texts):
-                    raise RuntimeError("embedding endpoint down")
+                    raise EmbeddingProviderError("embedding endpoint down")
 
             broken = MemoryService(
                 pool,

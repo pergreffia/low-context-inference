@@ -22,7 +22,7 @@ import asyncpg
 from context_proxy.config import RetrievalSettings
 from context_proxy.context.tokens import TokenCounter
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
-from context_proxy.memory.errors import RetrievalError, VectorStoreError
+from context_proxy.memory.errors import EmbeddingProviderError, RetrievalError, VectorStoreError
 from context_proxy.memory.models import TYPE_PRIORITY, MemoryCreate, MemoryStatus, RetrievedItem
 from context_proxy.memory.qdrant import QdrantVectorStore
 
@@ -214,7 +214,9 @@ class MemoryService:
                 ],
                 vector_size=len(vector),
             )
-        except Exception as exc:  # noqa: BLE001 - stays retryable (§8)
+        except VectorStoreError as exc:
+            # Expected vector-store outage: chunk stays pending, retried by a
+            # future indexing pass (§8). Programming errors propagate.
             logger.warning(
                 "vector_index_unavailable", extra={"chunk_id": chunk_id, "error": str(exc)}
             )
@@ -716,7 +718,7 @@ class MemoryService:
         try:
             vectors = await self._embedder.embed([text[: self._max_embed_chars]])
             return vectors[0]
-        except Exception as exc:  # noqa: BLE001 - degrade to lexical-only (§31)
+        except EmbeddingProviderError as exc:
             logger.warning("embedding_unavailable", extra={"error": str(exc)})
             return None
 
@@ -729,7 +731,9 @@ class MemoryService:
                 [{"id": point_id, "vector": vector, "payload": payload}],
                 vector_size=len(vector),
             )
-        except Exception as exc:  # noqa: BLE001
+        except VectorStoreError as exc:
+            # Expected vector-store outage at create-time: row stays
+            # rebuildable from PostgreSQL (§32). Programming errors propagate.
             logger.warning(
                 "vector_index_unavailable", extra={"point_id": point_id, "error": str(exc)}
             )

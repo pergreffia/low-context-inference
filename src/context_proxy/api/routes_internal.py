@@ -17,6 +17,10 @@ import uuid
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from context_proxy.api.validation import (
+    PayloadValidationError,
+    validate_chat_payload,
+)
 from context_proxy.context.engine import (
     ContextOverflowError as EngineContextOverflowError,
 )
@@ -160,6 +164,11 @@ async def context_preview(
     engine = getattr(request.app.state, "context_engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="context engine unavailable")
+
+    try:
+        validate_chat_payload({"messages": body.messages, "tools": body.tools})
+    except PayloadValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     history, current_request = separate_current_request(body.messages)
 

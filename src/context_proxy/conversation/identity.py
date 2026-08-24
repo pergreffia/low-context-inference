@@ -49,10 +49,13 @@ def _validated_explicit_id(raw: str) -> str:
     return raw
 
 
-def _session_conversation_id(token: str) -> str:
+def _session_conversation_id(token: str, max_chars: int) -> str:
     token = token.strip()
-    if not token or len(token) > 128:
-        raise InvalidConversationId("session identity header must be a short non-empty string")
+    if not token or len(token) > max_chars:
+        raise InvalidConversationId(
+            f"session identity header must be a short non-empty string "
+            f"(max {max_chars} characters)"
+        )
     return str(uuid.uuid5(_SESSION_NAMESPACE, token))
 
 
@@ -67,6 +70,13 @@ def resolve_conversation_id(request: Request, payload: dict, settings=None) -> t
     if client_header:
         session_token = request.headers.get(client_header.lower())
         if session_token:
-            return _session_conversation_id(session_token), payload
+            max_chars = int(
+                getattr(
+                    settings.conversation,
+                    "max_session_identity_chars",
+                    128,
+                )
+            )
+            return _session_conversation_id(session_token, max_chars), payload
 
     return str(uuid.uuid4()), payload

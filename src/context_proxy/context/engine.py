@@ -46,6 +46,7 @@ from context_proxy.config import AssemblySettings, RetrievalSettings
 from context_proxy.context.candidates import (
     TIER_BY_SOURCE,
     Candidate,
+    CandidateClassification,
     CandidateSource,
     DroppedCandidate,
     candidate_from_retrieved,
@@ -72,17 +73,31 @@ def separate_current_request(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split an inbound payload into (history, current_request).
 
-    The current request is the trailing interaction unit (the one starting at
-    the last user message, including any attached tool calls/results).
-    Structural separation: history candidates can never contain it and it can
-    never be duplicated as a recent turn.
+    The current request is the logical interaction started by the LAST user
+    message (including attached tool calls/results) — robust even when a
+    trailing system message follows it. Trailing system messages remain
+    system context in history; they never leak into the request unit.
     """
-    units = segment_messages(messages, counter or TokenCounter())
-    if not units:
-        return [], []
-    tail = units[-1]
-    flattened_history = [m for unit in units[:-1] for m in unit.messages]
-    return flattened_history, list(tail.messages)
+    last_user_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            last_user_index = index
+            break
+    if last_user_index == -1:
+        # No user interaction at all: everything is history.
+        return list(messages), []
+
+    # The request spans from the last user message up to the payload end,
+    # EXCEPT a maximal suffix of bare system messages, which remain system
+    # context in history.
+    end = len(messages)
+    trailing_systems: list[dict[str, Any]] = []
+    while end - 1 > last_user_index and messages[end - 1].get("role") == "system":
+        trailing_systems.insert(0, messages[end - 1])
+        end -= 1
+
+    history = [*messages[:last_user_index], *trailing_systems]
+    return history, list(messages[last_user_index:end])
 
 
 class ContextOverflowError(Exception):
@@ -495,6 +510,20 @@ class ContextAssemblyEngine:
         token_estimate = 0
         selected_items: list[SelectedItem] = []
         for candidate in allocation.ordered:
+            if (
+                candidate.classification == CandidateClassification.DERIVED_CONTEXT
+                and candidate.render
+                and candidate.render[0].get("role") == "system"
+                and "<retrieved_context>" not in str(
+                    candidate.render[0].get("content") or ""
+                )
+            ):
+                # Structural guard against future regressions: derived data
+                # must never pose as a bare trusted system instruction.
+                raise RuntimeError(
+                    f"derived candidate {candidate.key!r} rendered as an "
+                    "undelimited system instruction"
+                )
             messages.extend(candidate.render)
             token_estimate += candidate.tokens
             if candidate.source != CandidateSource.TOOL_DEFINITIONS:

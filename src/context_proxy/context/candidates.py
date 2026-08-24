@@ -194,6 +194,32 @@ def chunk_canonical_text(raw_content: str) -> str:
     return canonical_text(message_texts(lines))
 
 
+class CandidateClassification(StrEnum):
+    """Trust boundary for rendered context (M0–M6 review P1).
+
+    Retrieved memories/chunks derive from user-controlled conversation
+    content: they must NEVER be promoted to trusted system instructions.
+    They are delimited derived data instead.
+    """
+
+    TRUSTED_INSTRUCTION = "trusted_instruction"
+    DERIVED_CONTEXT = "derived_context"
+    UNTRUSTED_USER_DATA = "untrusted_user_data"
+
+
+# Static mapping: prevents future candidate builders from accidentally
+# promoting derived data to system-level instructions.
+CLASSIFICATION_BY_SOURCE: dict[CandidateSource, CandidateClassification] = {
+    CandidateSource.SYSTEM: CandidateClassification.TRUSTED_INSTRUCTION,
+    CandidateSource.TOOL_DEFINITIONS: CandidateClassification.TRUSTED_INSTRUCTION,
+    CandidateSource.PINNED: CandidateClassification.TRUSTED_INSTRUCTION,
+    CandidateSource.CURRENT_REQUEST: CandidateClassification.UNTRUSTED_USER_DATA,
+    CandidateSource.RECENT_TURN: CandidateClassification.UNTRUSTED_USER_DATA,
+    CandidateSource.MEMORY: CandidateClassification.DERIVED_CONTEXT,
+    CandidateSource.CHUNK: CandidateClassification.DERIVED_CONTEXT,
+}
+
+
 @dataclass(frozen=True)
 class Candidate:
     source: CandidateSource
@@ -208,6 +234,13 @@ class Candidate:
     @property
     def conversation_id(self) -> str | None:
         return self.metadata.get("conversation_id")
+
+    @property
+    def classification(self) -> CandidateClassification:
+        explicit = self.metadata.get("classification")
+        if isinstance(explicit, CandidateClassification):
+            return explicit
+        return CLASSIFICATION_BY_SOURCE[self.source]
 
 
 @dataclass(frozen=True)
@@ -230,9 +263,17 @@ def candidate_from_retrieved(item: RetrievedItem, counter: TokenCounter) -> Cand
     (conversation_id + start_seq/end_seq); memories carry a stable content
     fingerprint. Identical content is NOT identical authoritative history —
     raw interactions are only ever matched through their stored spans.
+    Trust boundary (M0–M6 review P1): retrieved blocks are DERIVED, untrusted
+    data. They render as system-role messages but wrapped in explicit
+    <retrieved_context> delimiters so user-controlled text can never pose as
+    trusted instructions.
     """
-    label = f"[{item.item_type}:{item.kind} {item.id}]"
-    content = f"{label} {item.content}"
+    label = f"[retrieved {item.item_type}:{item.kind} id={item.id}]"
+    content = (
+        "<retrieved_context>\n"
+        f"{label}\n{item.content}\n"
+        "</retrieved_context>"
+    )
     message = {"role": "system", "content": content}
     source = (
         CandidateSource.MEMORY if item.item_type == "memory" else CandidateSource.CHUNK
