@@ -136,6 +136,21 @@ MODEL=<model served by your inference endpoint>
 
 The proxy forwards requests to the configured inference endpoint and passes responses through unchanged (response bodies are never rewritten; hop-by-hop headers are stripped).
 
+## Dependency updates (reproducible builds)
+
+`constraints.txt` pins the full dependency tree. CI and the Docker image install with `-c constraints.txt`, so builds are reproducible across registry drift.
+
+Update procedure:
+
+```bash
+source .venv/bin/activate
+pip install -U <package>            # or refresh everything
+pip freeze --exclude-editable > constraints.txt
+pytest -q                            # verify, then commit the new lock
+```
+
+Never bump constraints without running the full suite; never loosen a pin to make a failing test pass.
+
 ## Tests
 
 ```bash

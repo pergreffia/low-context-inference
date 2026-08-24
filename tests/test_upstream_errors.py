@@ -101,7 +101,8 @@ def test_upstream_timeout_returns_openai_error():
     err = error_body(r)
     assert_openai_error_shape(err)
     assert err["code"] == "upstream_unavailable"
-    assert "timed out" in err["message"]
+    # P1.5: upstream failure messages are generic toward clients
+    assert err["message"] == "upstream inference endpoint is unavailable"
 
 
 def test_models_endpoint_upstream_failure_openai_error():

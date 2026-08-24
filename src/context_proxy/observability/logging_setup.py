@@ -17,18 +17,32 @@ from typing import Any
 from context_proxy.observability.middleware import current_request_id
 
 _BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
-_KEY_FIELDS = ("api_key", "authorization", "password", "secret", "token", "credential")
+# Sensitive FIELD-NAME markers: matched against normalized keys only, never
+# against free text — ordinary sentences containing the word "token" must not
+# be masked (M6-final hardening P1.4).
+_KEY_FIELDS = (
+    "api_key",
+    "apikey",
+    "api-key",
+    "token",
+    "access_token",
+    "authorization",
+    "secret",
+    "password",
+    "credential",
+    "client_secret",
+)
 _REDACTED = "[REDACTED]"
 
 
-def redact_text(value: str) -> str:
-    """Scrub inline Bearer tokens from free text."""
-    return _BEARER_RE.sub(rf"\1{_REDACTED}", value)
-
-
 def _is_sensitive_key(key: Any) -> bool:
-    name = str(key).lower()
-    return any(marker in name for marker in _KEY_FIELDS)
+    normalized = re.sub(r"[-_\s]", "", str(key)).lower()
+    return any(marker.replace("_", "") in normalized for marker in _KEY_FIELDS)
+
+
+def redact_text(value: str) -> str:
+    """Scrub inline Bearer credentials from free text."""
+    return _BEARER_RE.sub(rf"\1{_REDACTED}", value)
 
 
 def redact(value: Any) -> Any:
@@ -36,6 +50,7 @@ def redact(value: Any) -> Any:
 
     Strings get bearer scrubbing; sensitive-keyed fields are fully masked at
     any nesting depth; containers are traversed. Unknown types pass through.
+    Free text is NOT key-masked: the word "token" alone never triggers.
     """
     if isinstance(value, str):
         return redact_text(value)
@@ -70,9 +85,18 @@ class JsonFormatter(logging.Formatter):
             "event": redact_text(record.getMessage()),
             "request_id": current_request_id(),
         }
+        if record.exc_info:
+            exc_type, exc_value, exc_tb = record.exc_info
+            payload["exception"] = {
+                "type": exc_type.__name__ if exc_type else None,
+                "message": redact_text(str(exc_value)) if exc_value else None,
+                "traceback": redact_text(
+                    self.formatException(record.exc_info)
+                ),
+            }
         reserved = set(vars(logging.LogRecord("%", 0, "", 0, "", (), None)).keys())
         for key, value in record.__dict__.items():
-            if key in reserved or key in ("asctime", "message"):
+            if key in reserved or key in ("asctime", "message", "exc_info"):
                 continue
             if not key.startswith("_"):
                 payload[key] = redact(value)

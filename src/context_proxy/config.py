@@ -14,6 +14,10 @@ class ServerSettings(BaseModel):
     log_json: bool = False
     # Reject oversized request bodies before parsing (M5 resource limits).
     max_body_bytes: int = Field(default=8 * 1024 * 1024, gt=0)
+    # Bound the streaming assistant-capture buffer (M6-final hardening P1.3):
+    # past this size capture/persistence is disabled for that response while
+    # the passthrough continues untouched.
+    max_capture_bytes: int = Field(default=2 * 1024 * 1024, gt=0)
 
 
 class EndpointSettings(BaseModel):

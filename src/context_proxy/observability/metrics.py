@@ -254,6 +254,7 @@ UPSTREAM_DURATION: Histogram = REGISTRY.register(
         "context_proxy_upstream_duration_seconds",
         "Upstream inference call latency (headers received).",
         ("route",),
+        buckets=(0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0),
     )
 )
 LLM_TOKENS_TOTAL: Counter = REGISTRY.register(
@@ -274,6 +275,25 @@ RATE_LIMIT_REJECTS_TOTAL: Counter = REGISTRY.register(
     Counter(
         "context_proxy_rate_limit_rejects_total",
         "Requests rejected by the local rate limiter.",
+    )
+)
+ASSISTANT_CAPTURE_OVERFLOW_TOTAL: Counter = REGISTRY.register(
+    Counter(
+        "context_proxy_assistant_capture_overflow_total",
+        "Streaming responses whose assistant capture was disabled after "
+        "exceeding the configured size bound (passthrough unaffected).",
+    )
+)
+HTTP_STREAMS_ABORTED_TOTAL: Counter = REGISTRY.register(
+    Counter(
+        "context_proxy_http_streams_aborted_total",
+        "Responses that started streaming but aborted before completion.",
+    )
+)
+CLIENT_DISCONNECTS_TOTAL: Counter = REGISTRY.register(
+    Counter(
+        "context_proxy_client_disconnects_total",
+        "Requests abandoned by the client before completion.",
     )
 )
 CIRCUIT_STATE: Gauge = REGISTRY.register(

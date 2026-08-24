@@ -18,15 +18,36 @@ from typing import Any
 
 from context_proxy.conversation.store import HistoryDivergenceError
 from context_proxy.memory.errors import PersistenceInfrastructureError
+from context_proxy.observability.metrics import ASSISTANT_CAPTURE_OVERFLOW_TOTAL
 from context_proxy.providers.base import LLMStream
 
 logger = logging.getLogger(__name__)
 
 
 class AssistantCapture:
-    """Reconstructs OpenAI semantic state from streamed SSE chunks."""
+    """Reconstructs OpenAI semantic state from streamed SSE chunks.
 
-    def __init__(self) -> None:
+    Memory-bounded (hardening P1.3): once `max_bytes` is exceeded capture
+    stops accumulating (passthrough NEVER stops) and the response is marked
+    overflowed — persistence is skipped so a partial assistant message can
+    never be persisted as complete.
+    """
+
+    __slots__ = (
+        "_buffer",
+        "_role",
+        "_content_parts",
+        "_refusal_parts",
+        "_tool_calls",
+        "_finish_reason",
+        "_usage",
+        "_model",
+        "_saw_any_choice",
+        "_max_bytes",
+        "overflowed",
+    )
+
+    def __init__(self, max_bytes: int | None = None) -> None:
         self._buffer = bytearray()
         self._role: str | None = None
         self._content_parts: list[str] = []
@@ -36,12 +57,32 @@ class AssistantCapture:
         self._usage: dict[str, Any] | None = None
         self._model: str | None = None
         self._saw_any_choice = False
+        self._max_bytes = max_bytes
+        self.overflowed = False
 
     def feed(self, chunk: bytes) -> None:
+        if self.overflowed:
+            return  # passthrough continues; capture stays disabled
+        if self._max_bytes is not None:
+            projected = len(self._buffer) + len(chunk)
+            if projected > self._max_bytes:
+                self.overflowed = True
+                ASSISTANT_CAPTURE_OVERFLOW_TOTAL.inc()
+                logger.warning(
+                    "assistant_capture_overflow",
+                    extra={"captured_bytes": len(self._buffer), "chunk_bytes": len(chunk)},
+                )
+                return
         self._buffer.extend(chunk)
 
     def finalize(self) -> dict[str, Any] | None:
-        """Return the reconstructed assistant message, or None if nothing usable."""
+        """Return the reconstructed assistant message, or None if nothing usable.
+
+        Overflowed captures persist nothing: a partial assistant message must
+        never be treated as complete.
+        """
+        if self.overflowed:
+            return None
         for event in self._buffer.decode("utf-8", errors="replace").split("\n\n"):
             for line in event.splitlines():
                 if not line.startswith("data:"):
@@ -172,9 +213,12 @@ class PersistingLLMStream:
         self,
         inner: LLMStream,
         on_finished: Callable[[dict[str, Any] | None, dict[str, Any]], Awaitable[None]],
+        *,
+        max_capture_bytes: int | None = None,
     ):
         self._inner = inner
         self._on_finished = on_finished
+        self._max_capture_bytes = max_capture_bytes
 
     @property
     def status_code(self) -> int:
@@ -188,18 +232,31 @@ class PersistingLLMStream:
         return self._inner.passthrough_headers()
 
     async def iter_bytes(self):
-        capture = AssistantCapture()
+        capture = AssistantCapture(max_bytes=self._max_capture_bytes)
         completed = False
+        overflowed = False
         try:
             async for chunk in self._inner.iter_bytes():
                 capture.feed(chunk)
                 yield chunk
             completed = True
+            overflowed = capture.overflowed
         finally:
-            message = capture.finalize() if completed else None
-            metadata = capture.response_metadata() if completed else {}
+            message = None if (not completed or overflowed) else capture.finalize()
+            metadata = (
+                capture.response_metadata()
+                if completed and not overflowed
+                else {}
+            )
             if not completed:
                 logger.warning("assistant_stream_incomplete_persistence_skipped")
+            elif overflowed:
+                # Bounded capture (hardening P1.3): nothing persisted, client
+                # stream already fully delivered.
+                logger.warning(
+                    "assistant_persistence_skipped_capture_overflow",
+                    extra={"model": capture.response_metadata().get("model")},
+                )
             try:
                 await self._on_finished(message, metadata)
             except HistoryDivergenceError as exc:

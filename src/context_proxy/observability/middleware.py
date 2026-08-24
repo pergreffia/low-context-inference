@@ -29,8 +29,10 @@ from contextvars import ContextVar
 from starlette.responses import JSONResponse, Response
 
 from context_proxy.observability.metrics import (
+    CLIENT_DISCONNECTS_TOTAL,
     HTTP_REQUEST_DURATION,
     HTTP_REQUESTS_TOTAL,
+    HTTP_STREAMS_ABORTED_TOTAL,
     RATE_LIMIT_REJECTS_TOTAL,
 )
 from context_proxy.observability.ratelimit import RateLimiter
@@ -149,6 +151,7 @@ class ObservabilityMiddleware:
         async def send_wrapper(message) -> None:
             if message["type"] == "http.response.start":
                 state["response_status"] = message["status"]
+                state["response_started"] = True
                 headers = list(message.get("headers") or [])
                 names = {name.decode("latin-1").lower() for name, _ in headers}
                 if "x-request-id" not in names:
@@ -205,7 +208,10 @@ class ObservabilityMiddleware:
                 if outcome == "disconnected":
                     # Client vanished mid-upload: never reach the application,
                     # never fabricate a normal end-of-body on its behalf.
-                    state["response_status"] = 499  # client-closed-request
+                    # Tracked with a dedicated counter — 499 is not a real
+                    # HTTP status and must not appear in request metrics.
+                    CLIENT_DISCONNECTS_TOTAL.inc()
+                    state["response_status"] = None  # no HTTP status to count
                     logger.info(
                         "client_disconnected_during_body", extra={"route": route}
                     )
@@ -214,14 +220,23 @@ class ObservabilityMiddleware:
             try:
                 await self.app(scope, receive, send_wrapper)
             except Exception:
-                state["response_status"] = 500
+                # Response already started (streaming): the client saw its
+                # real status; track the abortion separately instead of
+                # inventing a fake HTTP status (hardening P2.1).
+                if state.get("response_started"):
+                    HTTP_STREAMS_ABORTED_TOTAL.inc()
+                else:
+                    state["response_status"] = 500
                 raise
         except Exception:
             raise
         finally:
-            # Single completion-accounting record for EVERY path (review P2):
-            # normal, 4xx validation, 413/429 rejects, disconnect, 500.
-            finish(int(state.get("response_status", 500)))
+            # Single completion-accounting record for EVERY path (review P2).
+            # Client-disconnects carry no HTTP status: they are tracked by the
+            # dedicated disconnect counter and excluded from request metrics.
+            status = state.get("response_status")
+            if status is not None:
+                finish(int(status))
             REQUEST_ID_CTX.reset(token)
 
 

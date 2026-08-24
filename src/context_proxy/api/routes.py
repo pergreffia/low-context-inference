@@ -268,7 +268,11 @@ async def chat_completions(request: Request):
         except ContextProxyError as exc:
             return await error_body_response(exc)
         # Always wrap: token accounting must survive a degraded store (M5).
-        stream = PersistingLLMStream(stream, persist_assistant)
+        stream = PersistingLLMStream(
+            stream,
+            persist_assistant,
+            max_capture_bytes=settings.server.max_capture_bytes,
+        )
         response = streaming_response(stream)
         for name, value in extra_headers.items():
             response.headers[name] = value

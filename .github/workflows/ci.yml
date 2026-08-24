@@ -13,11 +13,11 @@ jobs:
         with:
           python-version: "3.12"
       # Deterministic installs via `python -m pip` (M6-final review §7.1).
-      - name: Install dependencies
+      - name: Install dependencies (locked via constraints.txt)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
-          python -m pip install ruff
+          python -m pip install -e ".[dev]" -c constraints.txt
+          python -m pip install ruff -c constraints.txt
       - name: Ruff (configured rules)
         run: ruff check .
       # Fast suite only: PostgreSQL-backed tests auto-skip without
@@ -49,11 +49,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
+      - name: Install dependencies (locked via constraints.txt)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
-          python -m pip install ruff
+          python -m pip install -e ".[dev]" -c constraints.txt
+          python -m pip install ruff -c constraints.txt
       - name: Ruff
         run: ruff check .
       # Full suite against a clean PostgreSQL instance: exercises every

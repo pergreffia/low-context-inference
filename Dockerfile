@@ -2,10 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY pyproject.toml ./
+COPY pyproject.toml constraints.txt ./
 COPY src ./src
 
-RUN pip install --no-cache-dir . \
+# -c constraints.txt pins the FULL dependency tree (hardening P1.6):
+# reproducible image builds across registry drift.
+RUN pip install --no-cache-dir -c constraints.txt . \
     && useradd --system --uid 10001 --no-create-home contextproxy \
     && chown -R contextproxy:contextproxy /app
 

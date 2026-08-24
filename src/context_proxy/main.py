@@ -4,7 +4,8 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
+from starlette.responses import JSONResponse
 
 from context_proxy.api.routes import router
 from context_proxy.api.routes_internal import router as internal_router
@@ -167,10 +168,28 @@ def create_app(
         rate_limit_enabled=settings.rate_limit.enabled,
     )
 
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception):
+        """Last-resort handler: stable generic 500 body, no internal details.
+
+        Full diagnostics are already logged (with redaction) by the
+        observability middleware. TestClient(raise_server_exceptions=True)
+        bypasses this handler so tests can assert on real exception types.
+        """
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "message": "Internal server error",
+                    "type": "internal_error",
+                    "param": None,
+                    "code": "internal_error",
+                }
+            },
+        )
+
     @app.get("/metrics")
     async def prometheus_metrics():
-        from fastapi.responses import Response
-
         from context_proxy.observability.metrics import REGISTRY
 
         return Response(

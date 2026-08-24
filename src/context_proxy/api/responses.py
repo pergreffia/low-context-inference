@@ -93,10 +93,18 @@ async def error_body_response(exc: Exception) -> Response:
         )
     if isinstance(exc, UpstreamUnavailable):
         return openai_error(
-            str(exc),
+            "upstream inference endpoint is unavailable",
             err_type="api_error",
             code="upstream_unavailable",
             status_code=502,
         )
-    return openai_error(str(exc), err_type="internal_error", status_code=500)
+    # Unexpected internal error: NEVER expose exception details (paths, DSNs,
+    # credentials, library internals) to the client — full diagnostics stay in
+    # server logs under redaction (hardening P1.5).
+    return openai_error(
+        "Internal server error",
+        err_type="internal_error",
+        code="internal_error",
+        status_code=500,
+    )
 

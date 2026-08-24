@@ -68,15 +68,22 @@ class ContextPlan:
         return self.total_tokens + self.tools_tokens <= self.usable_budget
 
 
-def segment_messages(messages: list[dict[str, Any]], counter: TokenCounter) -> list[Unit]:
+def segment_messages(
+    messages: list[dict[str, Any]], counter: TokenCounter | None = None
+) -> list[Unit]:
     """Group messages into atomic interaction units (M2.1 §3).
 
     A turn starts at a user message and spans everything up to the next user
     message: user -> assistant(tool_call) -> tool(result) -> assistant(final)
-    stays one indivisible unit. System messages are their own units. Messages
-    preceding the first user message (rare assistant prefill) form a droppable
-    prefill unit so no assistant is ever retained without its interaction.
+    stays one indivisible unit. System/developer messages are their own
+    protected units emitted immediately — they never close an open interaction,
+    so a developer note landing mid-turn cannot orphan the assistant (review
+    B1); instruction units are normalized into the request head by packing.
+    Messages preceding the first user message (rare assistant prefill) form a
+    droppable prefill unit so no assistant is ever retained without its
+    interaction.
     """
+    counter = counter or TokenCounter()
     units: list[Unit] = []
     prefill: list[dict[str, Any]] = []
     turn: list[dict[str, Any]] | None = None
@@ -95,7 +102,11 @@ def segment_messages(messages: list[dict[str, Any]], counter: TokenCounter) -> l
     for message in messages:
         role = message.get("role")
         if is_instruction_role(role):
-            close_turn()
+            # Trusted instructions are emitted as their own protected unit
+            # WITHOUT closing the open interaction: a developer/system note
+            # landing between a user and its assistant must never orphan the
+            # assistant (M0–M6 review B1). Instructions are normalized into
+            # the head of the assembled request by the packing layer.
             close_prefill()
             units.append(Unit("system", (message,), counter.messages([message])))
         elif role == "user":

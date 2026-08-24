@@ -47,12 +47,14 @@ class MemoryService:
         vector_store: QdrantVectorStore,
         retrieval_settings: RetrievalSettings | None = None,
         max_embed_chars: int = 8000,
+        embed_batch_size: int = 64,
     ):
         self._pool = pool
         self._embedder = embedder
         self._qdrant = vector_store
         self._retrieval = retrieval_settings or RetrievalSettings()
         self._max_embed_chars = max_embed_chars
+        self._embed_batch_size = max(1, embed_batch_size)
         self._counter = TokenCounter()
 
     # ------------------------------------------------------------------ chunks
@@ -165,10 +167,12 @@ class MemoryService:
                 return created, settled_end
 
     async def _index_pending_chunks(self, conversation_id: str) -> int:
-        """Embed + upsert every chunk still pending; mark after success.
+        """Embed+upsert every chunk still pending; mark after success.
 
-        Embedding failure skips Qdrant entirely; either failure leaves
-        vector_indexed_at NULL so the next pass retries (M3 final review §7-9).
+        Embedding is BATCHED (hardening P2.2): one provider call per slice of
+        up to EMBED_BATCH_SIZE texts, preserving input/output ordering.
+        Embedding failure fails the whole slice (chunks stay retryable);
+        Qdrant failures are per-chunk.
         """
         rows = await self._pool.fetch(
             """
@@ -180,12 +184,69 @@ class MemoryService:
             conversation_id,
         )
         indexed = 0
-        for row in rows:
-            if await self._index_chunk(
-                conversation_id, str(row["id"]), row["raw_content"], row["start_seq"]
-            ):
-                indexed += 1
+        for batch_start in range(0, len(rows), self._embed_batch_size):
+            batch = rows[batch_start : batch_start + self._embed_batch_size]
+            vectors = await self._embed_batch([r["raw_content"] for r in batch])
+            if vectors is None:
+                continue  # whole slice stays pending (embedding leg down)
+            for row, vector in zip(batch, vectors, strict=True):
+                if await self._index_chunk(
+                    conversation_id,
+                    str(row["id"]),
+                    row["raw_content"],
+                    row["start_seq"],
+                    vector=vector,
+                ):
+                    indexed += 1
         return indexed
+
+    async def embed_texts_in_batches(
+        self, texts: list[str]
+    ) -> list[list[float]] | None:
+        """Batch-embed texts in slices of `_embed_batch_size`, order-preserving.
+
+        Returns None when the embedding leg fails for any slice (callers keep
+        their items retryable); empty input short-circuits to [].
+        """
+        if not texts:
+            return []
+        all_vectors: list[list[float]] = []
+        for start in range(0, len(texts), self._embed_batch_size):
+            slice_vectors = await self._safe_embed_batch(
+                texts[start : start + self._embed_batch_size]
+            )
+            if slice_vectors is None:
+                return None
+            all_vectors.extend(slice_vectors)
+        return all_vectors
+
+    async def _safe_embed_batch(
+        self, texts: list[str]
+    ) -> list[list[float]] | None:
+        """One provider call for `texts`; None on typed embedding failure."""
+        if not texts:
+            return []
+        try:
+            truncated = [t[: self._max_embed_chars] for t in texts]
+            vectors = await self._embedder.embed(truncated)
+        except EmbeddingProviderError as exc:
+            logger.warning(
+                "embedding_unavailable", extra={"count": len(texts), "error": str(exc)}
+            )
+            return None
+        if len(vectors) != len(texts):
+            logger.warning(
+                "embedding_count_mismatch",
+                extra={"expected": len(texts), "received": len(vectors)},
+            )
+            return None
+        return vectors
+
+    async def _embed_batch(
+        self, texts: list[str]
+    ) -> list[list[float]] | None:
+        """Alias kept for internal callers; see embed_texts_in_batches."""
+        return await self._safe_embed_batch(texts)
 
     async def _index_chunk(
         self,
@@ -193,9 +254,16 @@ class MemoryService:
         chunk_id: str,
         raw_content: str,
         start_seq: int | None = None,
+        *,
+        vector: list[float] | None = None,
     ) -> bool:
-        """Embed+upsert one chunk; marks vector_indexed_at only after success."""
-        vector = await self._safe_embed(raw_content)
+        """Embed (or reuse a batched vector) + upsert one chunk.
+
+        Marks vector_indexed_at only after a successful Qdrant upsert. When
+        `vector` is supplied the embedding step is skipped (batched path).
+        """
+        if vector is None:
+            vector = await self._safe_embed(raw_content)
         if vector is None:
             return False  # embedding failed: Qdrant not called, stays pending
         try:
@@ -622,46 +690,51 @@ class MemoryService:
             "memories": 0,
             "memories_failed": 0,
         }
-        for row in chunk_rows:
-            ok = await self._rebuild_chunk(
-                str(row["conversation_id"]),
-                str(row["id"]),
-                row["raw_content"],
-                row["start_seq"],
-            )
-            key = "chunks" if ok else "chunks_failed"
-            summary[key] += 1
-        for row in memory_rows:
-            # Bypass _embed_and_upsert: its blanket catch implements M3
-            # create-time best-effort semantics and would hide failures here.
-            # The rebuild path needs typed classification instead.
-            vector = await self._safe_embed(row["content"])
-            if vector is None:
-                summary["memories_failed"] += 1
-                summary["memories"] += 1
+        for batch_start in range(0, len(chunk_rows), self._embed_batch_size):
+            chunk_batch = chunk_rows[batch_start : batch_start + self._embed_batch_size]
+            vectors = await self._embed_batch([r["raw_content"] for r in chunk_batch])
+            if vectors is None:
+                summary["chunks_failed"] += len(chunk_batch)
                 continue
-            try:
-                await self._qdrant.upsert(
-                    [
-                        {
-                            "id": str(row["id"]),
-                            "vector": vector,
-                            "payload": {
-                                "conversation_id": str(row["conversation_id"]),
-                                "kind": row["kind"],
-                                "memory_id": str(row["id"]),
-                            },
-                        }
-                    ],
-                    vector_size=len(vector),
+            for row, vector in zip(chunk_batch, vectors, strict=True):
+                ok = await self._rebuild_chunk(
+                    str(row["conversation_id"]),
+                    str(row["id"]),
+                    row["raw_content"],
+                    row["start_seq"],
+                    vector=vector,
                 )
-            except VectorStoreError as exc:
-                # Expected provider outage: count it and keep rebuilding.
-                logger.warning(
-                    "rebuild_memory_upsert_failed", extra={"error": str(exc)}
-                )
-                summary["memories_failed"] += 1
-            summary["memories"] += 1
+                summary["chunks" if ok else "chunks_failed"] += 1
+
+        memory_texts = [r["content"][: self._max_embed_chars] for r in memory_rows]
+        vectors_by_memory = await self._embed_batch(memory_texts)
+        if vectors_by_memory is None:
+            summary["memories"] = len(memory_rows)
+            summary["memories_failed"] = len(memory_rows)
+        else:
+            for row, vector in zip(memory_rows, vectors_by_memory, strict=True):
+                try:
+                    await self._qdrant.upsert(
+                        [
+                            {
+                                "id": str(row["id"]),
+                                "vector": vector,
+                                "payload": {
+                                    "conversation_id": str(row["conversation_id"]),
+                                    "kind": row["kind"],
+                                    "memory_id": str(row["id"]),
+                                },
+                            }
+                        ],
+                        vector_size=len(vector),
+                    )
+                except VectorStoreError as exc:
+                    # Expected provider outage: count it and keep rebuilding.
+                    logger.warning(
+                        "rebuild_memory_upsert_failed", extra={"error": str(exc)}
+                    )
+                    summary["memories_failed"] += 1
+                summary["memories"] += 1
         logger.info(
             "vector_index_rebuilt",
             extra={**summary, "force": force},
@@ -674,14 +747,17 @@ class MemoryService:
         chunk_id: str,
         raw_content: str,
         start_seq: int | None,
+        *,
+        vector: list[float] | None = None,
     ) -> bool:
-        """Re-embed+upsert one chunk during a rebuild; typed failure handling.
+        """Upsert one chunk during a rebuild; typed failure handling.
 
         Unlike _index_chunk (which keeps M3's blanket retry semantics), the
         rebuild path must surface programming errors: only VectorStoreError is
         treated as an expected infrastructure failure here.
         """
-        vector = await self._safe_embed(raw_content)
+        if vector is None:
+            vector = await self._safe_embed(raw_content)
         if vector is None:
             return False  # embedding leg unavailable: stays retryable
         try:

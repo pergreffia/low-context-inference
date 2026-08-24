@@ -120,7 +120,8 @@ class TestDeveloperRole:
         sources = [s.source.value for s in plan.selected_items]
         assert "recent_turn" not in sources or True  # developer is system-tier
         keys = [s.key for s in plan.selected_items if s.source.value == "system"]
-        assert "unit:1" in keys  # developer is the second segmented unit
+        # with B1 fix the mid-stream developer unit is emitted FIRST
+        assert "unit:0" in keys
 
     def test_trailing_developer_goes_to_history_not_request(self):
         messages = [
