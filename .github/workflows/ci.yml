@@ -95,5 +95,5 @@ jobs:
           fi
 
           cat /tmp/health.json
-          grep -q '"status": "ok"' /tmp/health.json
+          grep -Eq '"status": ?"ok"' /tmp/health.json
           curl -sf http://localhost:8080/metrics > /dev/null
