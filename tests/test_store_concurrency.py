@@ -10,6 +10,8 @@ import asyncpg
 import httpx
 import pytest
 
+from context_proxy.memory.errors import PersistenceInfrastructureError
+
 MIGRATION_DSN = os.environ.get("TEST_DATABASE_URL", "")
 
 pytestmark = pytest.mark.skipif(
@@ -697,7 +699,7 @@ def test_streaming_unexpected_persistence_failure_no_retry(caplog):
         async def flaky_reconcile(conversation_id, messages, metadata=None):
             calls["reconcile"] += 1
             if calls["reconcile"] == 2:  # inbound=1 ok, assistant=2 fails
-                raise RuntimeError("simulated db outage")
+                raise PersistenceInfrastructureError("simulated db outage")
             return await original_reconcile(conversation_id, messages, metadata)
 
         store.reconcile_history = flaky_reconcile  # type: ignore[method-assign]

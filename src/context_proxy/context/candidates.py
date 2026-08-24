@@ -135,9 +135,23 @@ def message_texts(messages: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -
             rendered_content = ""
         parts.append(f"{role}: {rendered_content}")
         for tool_call in message.get("tool_calls") or []:
-            function = tool_call.get("function") or {}
+            payload_container = (
+                tool_call.get("function")
+                if isinstance(tool_call.get("function"), dict)
+                else tool_call.get("custom")
+                if isinstance(tool_call.get("custom"), dict)
+                else {}
+            )
+            kind_label = (
+                "function" if isinstance(tool_call.get("function"), dict) else "custom"
+            )
+            payload_value = (
+                payload_container.get("arguments")
+                or payload_container.get("input")
+            )
             parts.append(
-                f"tool_call: {function.get('name')} {function.get('arguments')}"
+                f"tool_call[{kind_label}]: "
+                f"{payload_container.get('name')} {payload_value}"
             )
     return "\n".join(parts)
 

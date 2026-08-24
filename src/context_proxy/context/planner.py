@@ -34,6 +34,13 @@ class ContextOverflowError(Exception):
 
 UnitKind = Literal["system", "turn", "prefill"]
 
+# Roles that carry trusted instructions and share the protected tier.
+INSTRUCTION_ROLES = frozenset({"system", "developer"})
+
+
+def is_instruction_role(role: Any) -> bool:
+    return role in INSTRUCTION_ROLES
+
 
 @dataclass(frozen=True)
 class Unit:
@@ -87,14 +94,14 @@ def segment_messages(messages: list[dict[str, Any]], counter: TokenCounter) -> l
 
     for message in messages:
         role = message.get("role")
-        if role == "user":
-            close_turn()
-            close_prefill()
-            turn = [message]
-        elif role == "system":
+        if is_instruction_role(role):
             close_turn()
             close_prefill()
             units.append(Unit("system", (message,), counter.messages([message])))
+        elif role == "user":
+            close_turn()
+            close_prefill()
+            turn = [message]
         elif turn is not None:
             turn.append(message)
         else:
@@ -105,8 +112,9 @@ def segment_messages(messages: list[dict[str, Any]], counter: TokenCounter) -> l
 
 
 def plan_context(
-    messages: list[dict[str, Any]],
+    history: list[dict[str, Any]],
     *,
+    current_request: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     usable_budget: int,
     reserved_tokens: int = 0,
@@ -114,43 +122,67 @@ def plan_context(
 ) -> ContextPlan:
     """Build the largest within-budget raw context from recent messages.
 
-    Priority when trimming (master prompt §16): system prompts and the current
-    request are never sacrificed; oldest non-system units are dropped whole.
-    reserved_tokens covers future context consumers (e.g. pinned state, M3+)
+    The current request is STRUCTURALLY separate (shared semantics with the
+    M4 engine via separate_current_request): it is mandatory whenever it fits
+    and can never be dropped under budget pressure, even when instruction
+    units (system/developer) trail it in the inbound payload.
+
+    Priority when trimming (master prompt §16): system/developer instructions
+    and the current request are never sacrificed; oldest non-instruction
+    units are dropped whole. reserved_tokens covers future context consumers
     so the final context can never exceed usable_budget once they land.
     Raises ContextOverflowError if no valid plan exists.
     """
     counter = counter or TokenCounter()
     tools_tokens = counter.tools(tools)
-    available_for_messages = usable_budget - tools_tokens - reserved_tokens
 
-    original = segment_messages(messages, counter)
+    current_unit = (
+        Unit("turn", tuple(current_request), counter.messages(current_request))
+        if current_request
+        else None
+    )
+    current_tokens = current_unit.tokens if current_unit else 0
+
+    original = segment_messages(history, counter)
+    mandatory = (
+        sum(u.tokens for u in original if u.is_system) + tools_tokens + reserved_tokens
+        + current_tokens
+    )
+    if mandatory > usable_budget:
+        raise ContextOverflowError(mandatory, usable_budget)
+
+    available_for_history = usable_budget - tools_tokens - reserved_tokens - current_tokens
     kept: list[Unit | None] = list(original)
     total = sum(unit.tokens for unit in original)
 
-    if total > available_for_messages:
-        # Never drop the last unit (current request) nor system units.
-        droppable_positions = [i for i, u in enumerate(original[:-1]) if not u.is_system]
-        for position in droppable_positions:
-            if total <= available_for_messages:
+    if total > available_for_history:
+        # Drop oldest non-instruction units whole.
+        for position, unit in enumerate(original):
+            if total <= available_for_history:
                 break
-            total -= original[position].tokens
+            if unit.is_system:
+                continue
+            total -= unit.tokens
             kept[position] = None
 
     final_units = [u for u in kept if u is not None]
+    if current_unit is not None:
+        final_units.append(current_unit)
     final_total = sum(u.tokens for u in final_units)
     if final_total + tools_tokens > usable_budget:
         raise ContextOverflowError(final_total + tools_tokens, usable_budget)
 
-    dropped_units = len(original) - len(final_units)
-    dropped_tokens = sum(u.tokens for u in original) - final_total
+    dropped_units = len(original) - (len(final_units) - (1 if current_unit else 0))
+    dropped_tokens = sum(u.tokens for u in original) - (
+        final_total - current_tokens
+    )
     logger.info(
         "context_planned",
         extra={
             "units_total": len(original),
             "units_kept": len(final_units),
             "dropped_units": dropped_units,
-            "dropped_tokens": dropped_tokens,
+            "dropped_tokens": max(0, dropped_tokens),
             "message_tokens": final_total,
             "tools_tokens": tools_tokens,
             "usable_budget": usable_budget,
@@ -162,10 +194,11 @@ def plan_context(
         tools_tokens=tools_tokens,
         usable_budget=usable_budget,
         dropped_units=dropped_units,
-        dropped_tokens=dropped_tokens,
+        dropped_tokens=max(0, dropped_tokens),
         details={
             "units_total": len(original),
             "units_kept": len(final_units),
             "system_tokens": sum(u.tokens for u in final_units if u.is_system),
+            "current_request_tokens": current_tokens,
         },
     )

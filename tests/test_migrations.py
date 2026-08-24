@@ -49,6 +49,7 @@ def test_migrations_idempotent_and_schema_present():
         "0008_chunk_span_not_null.sql",
         "0009_conversation_media.sql",
         "0010_media_source_size.sql",
+        "0011_developer_role.sql",
     } <= applied | set(first)
     assert second == []  # never reapplied within a single process
     expected = {
@@ -225,6 +226,7 @@ def test_concurrent_startup_applies_each_exactly_once():
                 "0008_chunk_span_not_null.sql",
                 "0009_conversation_media.sql",
                 "0010_media_source_size.sql",
+                "0011_developer_role.sql",
             }
             # every migration applied exactly once across both runners
             assert len(names) == len(set(names))
@@ -271,7 +273,7 @@ def test_migrations_from_clean_database_create_full_m3_schema():
                 await pool.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
 
             completed = await apply_migrations(pool)
-            assert len(completed) == 10
+            assert len(completed) == 11
 
             cols = await pool.fetch(
                 """

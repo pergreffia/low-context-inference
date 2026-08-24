@@ -758,7 +758,10 @@ class TestTokenAccountingStreamingWithStore:
         llm_client = httpx.AsyncClient(
             base_url=UPSTREAM, transport=httpx.MockTransport(handler)
         )
-        store = self._store(reconcile_raises=RuntimeError("persistence down"))
+        from context_proxy.memory.errors import PersistenceInfrastructureError
+        store = self._store(
+            reconcile_raises=PersistenceInfrastructureError("persistence down")
+        )
         app = create_app(make_settings(), llm_client=llm_client, store=store)
         with TestClient(app) as client:
             response = client.post(

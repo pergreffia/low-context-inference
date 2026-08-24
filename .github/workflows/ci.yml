@@ -12,9 +12,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev]" ruff
-      - run: ruff check .
-      - run: pytest -q
+      # Deterministic installs via `python -m pip` (M6-final review §7.1).
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip install ruff
+      - name: Ruff (configured rules)
+        run: ruff check .
+      # Fast suite only: PostgreSQL-backed tests auto-skip without
+      # TEST_DATABASE_URL (explicit contract, see integration job).
+      - name: Unit tests
+        run: python -m pytest -q
 
   integration-postgres:
     runs-on: ubuntu-latest
@@ -33,22 +42,29 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
+      # Consumed by the suites to run migrations + PG-backed tests.
       TEST_DATABASE_URL: postgresql://context_proxy:context_proxy@localhost:55432/context_proxy
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev]"
-      # Migrations are applied by the suite itself (apply_migrations); the job
-      # fails if ANY integration test fails, including the full M3 memory set.
-      - run: pytest -q
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip install ruff
+      - name: Ruff
+        run: ruff check .
+      # Full suite against a clean PostgreSQL instance: exercises every
+      # migration from scratch and must not silently skip.
+      - name: Integration tests (PostgreSQL)
+        run: python -m pytest -q
 
   docker-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # M5: production image must keep building (non-root, healthcheck).
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
@@ -56,3 +72,18 @@ jobs:
           push: false
           load: true
           tags: context-proxy:ci
+      # Lightweight runtime smoke test: entrypoint, imports, healthcheck.
+      # No PostgreSQL/Qdrant needed — the proxy degrades gracefully.
+      - name: Smoke test (healthz)
+        run: |
+          docker run -d --name smoke -p 8080:8080 context-proxy:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/healthz > /tmp/health.json; then
+              break
+            fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          grep -q '"status": "ok"' /tmp/health.json
+          curl -sf http://localhost:8080/metrics > /dev/null
+          docker rm -f smoke

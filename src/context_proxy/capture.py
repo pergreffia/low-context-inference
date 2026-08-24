@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from context_proxy.conversation.store import HistoryDivergenceError
+from context_proxy.memory.errors import PersistenceInfrastructureError
 from context_proxy.providers.base import LLMStream
 
 logger = logging.getLogger(__name__)
@@ -88,31 +89,68 @@ class AssistantCapture:
             self._refusal_parts.append(delta["refusal"])
         for tool_call in delta.get("tool_calls") or []:
             index = tool_call.get("index", 0)
-            slot = self._tool_calls.setdefault(
-                index,
-                {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
-            )
+            slot = self._tool_calls.setdefault(index, {})
             if tool_call.get("id"):
                 slot["id"] = tool_call["id"]
-            function = tool_call.get("function") or {}
-            if function.get("name"):
-                slot["function"]["name"] += function["name"]
-            if function.get("arguments"):
-                slot["function"]["arguments"] += function["arguments"]
+            if tool_call.get("type"):
+                slot["type"] = tool_call["type"]
+            # Preserve unknown transport fields from the FIRST fragment only;
+            # never invent or discard semantic fields.
+            for key, value in tool_call.items():
+                if key not in ("index", "id", "type", "function", "custom"):
+                    slot.setdefault(key, value)
+            function = tool_call.get("function")
+            if isinstance(function, dict):
+                fn = slot.setdefault(
+                    "function", {"name": "", "arguments": ""}
+                )
+                if function.get("name"):
+                    fn["name"] += function["name"]
+                if function.get("arguments"):
+                    fn["arguments"] += function["arguments"]
+            custom = tool_call.get("custom")
+            if isinstance(custom, dict):
+                cc = slot.setdefault("custom", {"name": "", "input": ""})
+                if custom.get("name"):
+                    cc["name"] += custom["name"]
+                if custom.get("input"):
+                    cc["input"] += custom["input"]
         if choice.get("finish_reason"):
             self._finish_reason = choice["finish_reason"]
 
     def _build_message(self) -> dict[str, Any]:
         content = "".join(self._content_parts) or None
         refusal = "".join(self._refusal_parts) or None
-        tool_calls = (
-            [
-                self._tool_calls[index]
-                for index in sorted(self._tool_calls)
-                if self._tool_calls[index]["id"]
-            ]
-            or None
-        )
+        tool_calls: list[dict[str, Any]] = []
+        for index in sorted(self._tool_calls):
+            call = self._tool_calls[index]
+            if not call.get("id"):
+                continue
+            if call.get("type") == "custom" or "custom" in call:
+                custom = call.get("custom") or {}
+                rebuilt: dict[str, Any] = {
+                    "id": call["id"],
+                    "type": "custom",
+                    "custom": {
+                        "name": custom.get("name", ""),
+                        "input": custom.get("input", ""),
+                    },
+                }
+            else:
+                function = call.get("function") or {}
+                rebuilt = {
+                    "id": call["id"],
+                    "type": call.get("type", "function"),
+                    "function": {
+                        "name": function.get("name", ""),
+                        "arguments": function.get("arguments", ""),
+                    },
+                }
+            # unknown transport-preserved fields ride along untouched
+            for key, value in call.items():
+                if key not in ("id", "type", "function", "custom"):
+                    rebuilt[key] = value
+            tool_calls.append(rebuilt)
         message: dict[str, Any] = {
             "role": self._role or "assistant",
             "content": content,
@@ -172,8 +210,21 @@ class PersistingLLMStream:
                     "assistant_persistence_conflict",
                     extra={"conversation_id": exc.conversation_id, "index": exc.index},
                 )
-            except Exception as exc:  # noqa: BLE001 - passthrough first, always
+            except PersistenceInfrastructureError as exc:
+                # Expected infrastructure failure: passthrough already done,
+                # degrade with the standard event.
                 logger.warning(
                     "assistant_persistence_failed",
                     extra={"error": str(exc)},
+                )
+            except Exception as exc:
+                # The passthrough is sacred and already completed: we never
+                # break the stream. But unexpected programming errors are NOT
+                # logged as ordinary infrastructure degradation — they get a
+                # dedicated error event with traceback so bugs stay visible
+                # (M6-final review §3).
+                logger.error(
+                    "assistant_persistence_programming_error",
+                    extra={"error": str(exc), "error_type": type(exc).__name__},
+                    exc_info=True,
                 )

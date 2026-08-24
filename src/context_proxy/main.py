@@ -55,70 +55,77 @@ def create_app(
         configure_logging(settings.server.log_level, log_json=settings.server.log_json)
         app.state.settings = settings
         app.state.breaker = breaker
-        await database.start()
-        app.state.database = database
-        if store is not None:
-            # Test/injected store wins over the database-backed one.
-            app.state.store = store
-        elif database.available and database.pool is not None:
-            app.state.store = PostgresConversationStore(database.pool)
-        else:
-            app.state.store = None
-
-        if memory_service is not None:
-            app.state.memory = memory_service
-        elif database.available and database.pool is not None:
-            # Ownership rule (M3 review §2): clients created here are closed on
-            # shutdown; injected/external clients are NEVER closed by the app.
-            embed_client = embedding_client
-            if embed_client is None:
-                embed_client = httpx.AsyncClient(
-                    base_url=settings.embeddings.base_url,
-                    timeout=httpx.Timeout(settings.embeddings.timeout_seconds),
-                )
-                owned_clients.append(embed_client)
-            qdrant_http = qdrant_client
-            if qdrant_http is None:
-                qdrant_http = httpx.AsyncClient(
-                    base_url=settings.qdrant.base_url,
-                    timeout=httpx.Timeout(settings.qdrant.timeout_seconds),
-                )
-                owned_clients.append(qdrant_http)
-
-            embedder = OpenAICompatibleEmbeddingProvider(
-                settings.embeddings, client=embed_client
-            )
-            vectors = QdrantVectorStore(
-                settings.qdrant.base_url,
-                collection=settings.qdrant.collection,
-                client=qdrant_http,
-            )
-            app.state.memory = MemoryService(
-                database.pool,
-                embedder,
-                vectors,
-                retrieval_settings=settings.retrieval,
-                max_embed_chars=settings.memory.max_embed_chars,
-            )
-        else:
-            app.state.memory = None
-        yield
-        # Graceful shutdown (§17): each owned resource is closed in isolation —
-        # one cleanup failure must not prevent the others from being released.
-        if owned_llm_client:
-            try:
-                await app.state.llm.aclose()
-            except Exception as exc:  # noqa: BLE001 - isolation is the point
-                logger.warning("inference_client_close_failed", extra={"error": str(exc)})
-        for client in owned_clients:
-            try:
-                await client.aclose()
-            except Exception as exc:  # noqa: BLE001 - isolation is the point
-                logger.warning("client_close_failed", extra={"error": str(exc)})
+        started = False
         try:
-            await database.close()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("database_close_failed", extra={"error": str(exc)})
+            await database.start()
+            app.state.database = database
+            if store is not None:
+                # Test/injected store wins over the database-backed one.
+                app.state.store = store
+            elif database.available and database.pool is not None:
+                app.state.store = PostgresConversationStore(database.pool)
+            else:
+                app.state.store = None
+
+            if memory_service is not None:
+                app.state.memory = memory_service
+            elif database.available and database.pool is not None:
+                # Ownership rule (M3 review §2): clients created here are closed on
+                # shutdown; injected/external clients are NEVER closed by the app.
+                embed_client = embedding_client
+                if embed_client is None:
+                    embed_client = httpx.AsyncClient(
+                        base_url=settings.embeddings.base_url,
+                        timeout=httpx.Timeout(settings.embeddings.timeout_seconds),
+                    )
+                    owned_clients.append(embed_client)
+                qdrant_http = qdrant_client
+                if qdrant_http is None:
+                    qdrant_http = httpx.AsyncClient(
+                        base_url=settings.qdrant.base_url,
+                        timeout=httpx.Timeout(settings.qdrant.timeout_seconds),
+                    )
+                    owned_clients.append(qdrant_http)
+
+                embedder = OpenAICompatibleEmbeddingProvider(
+                    settings.embeddings, client=embed_client
+                )
+                vectors = QdrantVectorStore(
+                    settings.qdrant.base_url,
+                    collection=settings.qdrant.collection,
+                    client=qdrant_http,
+                )
+                app.state.memory = MemoryService(
+                    database.pool,
+                    embedder,
+                    vectors,
+                    retrieval_settings=settings.retrieval,
+                    max_embed_chars=settings.memory.max_embed_chars,
+                )
+            else:
+                app.state.memory = None
+            started = True
+            yield
+        finally:
+            # Unconditional cleanup (§17 + final review §4): runs on graceful
+            # shutdown AND on any startup failure after resource creation.
+            # Each owned resource closes in isolation — one failure never
+            # blocks the others. Injected resources are never touched.
+            if owned_llm_client and getattr(app.state, "llm", None) is not None:
+                try:
+                    await app.state.llm.aclose()
+                except Exception as exc:  # noqa: BLE001 - isolation is the point
+                    logger.warning("inference_client_close_failed", extra={"error": str(exc)})
+            for client in owned_clients:
+                try:
+                    await client.aclose()
+                except Exception as exc:  # noqa: BLE001 - isolation is the point
+                    logger.warning("client_close_failed", extra={"error": str(exc)})
+            try:
+                await database.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("database_close_failed", extra={"error": str(exc)})
+        _ = started  # kept for readability of the startup/teardown split
 
     app = FastAPI(title="Context Proxy", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings

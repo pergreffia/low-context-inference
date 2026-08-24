@@ -20,6 +20,20 @@ class RetrievalError(Exception):
         super().__init__(message)
 
 
+class PersistenceInfrastructureError(Exception):
+    """Expected conversation-persistence infrastructure failure.
+
+    Simulates/models PostgreSQL outages and interface failures for callers
+    that degrade to passthrough-only mode. Programming errors (TypeError,
+    KeyError, assertion failures, reconciliation bugs) must NEVER be wrapped
+    in this type — they propagate as real application errors.
+    """
+
+    def __init__(self, message: str, *, cause: Exception | None = None):
+        self.cause = cause
+        super().__init__(message)
+
+
 class VectorStoreError(Exception):
     """Expected vector-store infrastructure failure (M5 final review §1).
 

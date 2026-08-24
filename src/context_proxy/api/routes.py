@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 
+import asyncpg
 from fastapi import APIRouter, Request
 
 from context_proxy.api.responses import (
@@ -27,13 +28,27 @@ from context_proxy.conversation.identity import (
     resolve_conversation_id,
 )
 from context_proxy.conversation.store import HistoryDivergenceError
-from context_proxy.memory.errors import RetrievalError
+from context_proxy.memory.errors import (
+    PersistenceInfrastructureError,
+    RetrievalError,
+)
 from context_proxy.observability.metrics import record_tokens
 from context_proxy.observability.middleware import record_stage
 from context_proxy.providers.errors import ContextProxyError
 
 router = APIRouter()
 logger = logging.getLogger("context_proxy.request")
+
+# Expected infrastructure failures that legitimately degrade persistence
+# (M6-final review §3). Anything else — TypeError, KeyError, assertion
+# failures, reconciliation bugs — propagates as a real application error.
+_PERSISTENCE_INFRA_ERRORS = (
+    asyncpg.PostgresError,
+    asyncpg.InterfaceError,
+    asyncio.TimeoutError,
+    OSError,
+    PersistenceInfrastructureError,
+)
 
 
 def _conversation_headers(conversation_id: str | None) -> dict[str, str]:
@@ -105,7 +120,8 @@ async def chat_completions(request: Request):
                 status_code=409,
                 headers=extra_headers,
             )
-        except Exception as exc:  # noqa: BLE001 - degradation is intentional (§31)
+        except _PERSISTENCE_INFRA_ERRORS as exc:
+            # Expected infrastructure failure: degrade to passthrough-only.
             logger.warning("inbound_persistence_failed", extra={"error": str(exc)})
             store = None
 
@@ -145,8 +161,10 @@ async def chat_completions(request: Request):
                 conversation_id=conversation_id,
             )
         else:
+            history_msgs, current_req = separate_current_request(messages)
             plan = plan_context(
-                messages,
+                history=history_msgs,
+                current_request=current_req,
                 tools=tools,
                 usable_budget=settings.context.usable_budget_tokens,
                 reserved_tokens=settings.context.pinned_budget_tokens,
@@ -198,7 +216,8 @@ async def chat_completions(request: Request):
                 },
             )
             return
-        except Exception as exc:  # noqa: BLE001 - passthrough first, always
+        except _PERSISTENCE_INFRA_ERRORS as exc:
+            # Expected infrastructure failure: response already safe upstream.
             logger.warning(
                 "assistant_persistence_failed",
                 extra={

@@ -205,3 +205,38 @@ def test_chunking_covers_multimodal_turns():
     import json
 
     asyncio.run(_run())
+
+
+def test_developer_role_persists_and_replays_verbatim():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            store = _store(pool)
+            conv = str(uuid.uuid4())
+            inbound = [
+                {"role": "system", "content": "base policy"},
+                {"role": "developer", "content": "always cite file paths"},
+                {"role": "user", "content": "where is the bug?"},
+                {"role": "assistant", "content": "loop"},
+                {"role": "user", "content": "still there?"},
+            ]
+            await store.reconcile_history(conv, inbound)
+            await store.reconcile_history(conv, inbound)  # idempotent replay
+
+            rows = await pool.fetch(
+                "SELECT role, content FROM messages WHERE conversation_id=$1::uuid ORDER BY seq",
+                conv,
+            )
+            assert [r["role"] for r in rows] == [
+                "system", "developer", "user", "assistant", "user",
+            ]
+            import json as _json
+            assert _json.loads(rows[1]["content"])["role"] == "developer"
+            assert _json.loads(rows[1]["content"])["content"] == "always cite file paths"
+
+            history = await store.get_messages(conv)
+            assert history == inbound
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())

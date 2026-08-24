@@ -55,7 +55,11 @@ from context_proxy.context.candidates import (
     message_texts,
 )
 from context_proxy.context.mmr import cosine_similarity, mmr_select
-from context_proxy.context.planner import Unit, segment_messages
+from context_proxy.context.planner import (
+    INSTRUCTION_ROLES,
+    Unit,
+    segment_messages,
+)
 from context_proxy.context.scoring import relevance_score
 from context_proxy.context.tokens import TokenCounter
 from context_proxy.memory.models import RetrievedItem
@@ -92,7 +96,10 @@ def separate_current_request(
     # context in history.
     end = len(messages)
     trailing_systems: list[dict[str, Any]] = []
-    while end - 1 > last_user_index and messages[end - 1].get("role") == "system":
+    while (
+            end - 1 > last_user_index
+            and messages[end - 1].get("role") in INSTRUCTION_ROLES
+        ):
         trailing_systems.insert(0, messages[end - 1])
         end -= 1
 

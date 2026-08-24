@@ -7,6 +7,8 @@ import httpx
 from conftest import CHAT_RESPONSE, SSE_BODY, client_for_handler, make_settings
 from helpers import chat_payload
 
+from context_proxy.memory.errors import PersistenceInfrastructureError
+
 
 class FakeConversationStore:
     """In-memory ConversationStore for unit tests (mocks allowed in tests only)."""
@@ -330,7 +332,7 @@ class FlakyOnceStore(FakeConversationStore):
     async def reconcile_history(self, conversation_id, messages, metadata=None):
         self.calls += 1
         if self.calls == 2:
-            raise RuntimeError("simulated db outage")
+            raise PersistenceInfrastructureError("simulated db outage")
         return await super().reconcile_history(conversation_id, messages, metadata)
 
 

@@ -123,7 +123,9 @@ class TestPlanContext:
 
     def test_within_budget_passthrough_unchanged(self):
         messages = [msg("system", "sys"), msg("user", "hi"), msg("assistant", "hello")]
-        plan = plan_context(messages, tools=None, usable_budget=10_000)
+        plan = plan_context(
+            history=messages,
+            current_request=[], tools=None, usable_budget=10_000)
         assert plan.messages == messages
         assert plan.dropped_units == 0
         assert plan.within_budget
@@ -131,7 +133,9 @@ class TestPlanContext:
     def test_oversized_history_trims_oldest_keeps_system_and_last(self):
         history = [msg("user", "x" * 400), msg("assistant", "y" * 400), msg("user", "z" * 400)]
         messages = [msg("system", "keep-me"), *history, msg("user", "current")]
-        plan = plan_context(messages, tools=None, **self.small_budget(300))
+        plan = plan_context(
+            history=messages,
+            current_request=[], tools=None, **self.small_budget(300))
         assert plan.messages[0] == messages[0]  # system preserved
         assert plan.messages[-1] == messages[-1]  # current request preserved
         assert plan.within_budget
@@ -141,7 +145,9 @@ class TestPlanContext:
 
     def test_system_never_dropped_even_when_history_huge(self):
         messages = [msg("system", "S"), *[msg("user", "h" * 500)] * 5, msg("user", "now")]
-        plan = plan_context(messages, tools=None, **self.small_budget(250))
+        plan = plan_context(
+            history=messages,
+            current_request=[], tools=None, **self.small_budget(250))
         assert plan.messages[0]["role"] == "system"
         assert plan.within_budget
 
@@ -152,7 +158,9 @@ class TestPlanContext:
             *interaction,
             msg("user", "current question that must survive"),
         ]
-        plan = plan_context(messages, tools=None, **self.small_budget(150))
+        plan = plan_context(
+            history=messages,
+            current_request=[], tools=None, **self.small_budget(150))
         roles = [m["role"] for m in plan.messages]
         if any(m["content"] and m["content"].startswith("a") for m in plan.messages):
             # if the interaction survived, it survived whole
@@ -163,19 +171,28 @@ class TestPlanContext:
         big_tools = [{"type": "function", "function": {"name": "f", "description": "d" * 800}}]
         messages = [msg("user", "tiny")]
         with pytest.raises(ContextOverflowError):
-            plan_context(messages, tools=big_tools, usable_budget=100)
+            plan_context(
+            history=messages,
+            current_request=[], tools=big_tools, usable_budget=100)
 
     def test_impossible_request_raises_overflow(self):
-        messages = [msg("system", "s"), msg("user", "g" * 5000)]
         with pytest.raises(ContextOverflowError) as excinfo:
-            plan_context(messages, tools=None, usable_budget=200)
+            plan_context(
+                history=[msg("system", "s")],
+                current_request=[msg("user", "g" * 5000)],
+                tools=None,
+                usable_budget=200,
+            )
         assert excinfo.value.required_tokens > excinfo.value.usable_budget
 
     def test_budget_shrinks_when_tools_grow(self):
         messages = [msg("user", "w" * 600), msg("assistant", "w" * 600), msg("user", "cur")]
-        small = plan_context(messages, tools=None, usable_budget=350)
+        small = plan_context(
+            history=messages,
+            current_request=[], tools=None, usable_budget=350)
         big = plan_context(
-            messages,
+            history=messages,
+            current_request=[],
             tools=[{"type": "function", "function": {"name": "f", "description": "d" * 200}}],
             usable_budget=350,
         )
@@ -188,14 +205,20 @@ class TestPlanContext:
         rng = random.Random(42)
         for _ in range(50):
             n_units = rng.randint(2, 12)
-            messages: list[dict] = [msg("system", "s" * rng.randint(0, 50))]
+            history: list[dict] = [msg("system", "s" * rng.randint(0, 50))]
             for _i in range(n_units):
-                messages.append(msg(rng.choice(["user", "assistant"]), "q" * rng.randint(0, 400)))
+                history.append(msg(rng.choice(["user", "assistant"]), "q" * rng.randint(0, 400)))
+            current = [msg("user", "cur")]
             budget = rng.randint(80, 1200)
             try:
-                plan = plan_context(messages, tools=None, usable_budget=budget)
+                plan = plan_context(
+                    history=history,
+                    current_request=current,
+                    tools=None,
+                    usable_budget=budget,
+                )
                 assert plan.total_tokens + plan.tools_tokens <= budget
-                assert plan.messages[-1] == messages[-1]
+                assert plan.messages[-1] == current[-1]
             except ContextOverflowError:
                 pass  # legitimate when even system+current exceed budget
 
@@ -213,7 +236,9 @@ class TestInteractionUnitTrimming:
             msg("user", "u2" * 100),
             msg("assistant", "final answer"),  # newest interaction
         ]
-        plan = plan_context(messages, tools=None, usable_budget=260, counter=TokenCounter())
+        plan = plan_context(
+            history=messages,
+            current_request=[], tools=None, usable_budget=260, counter=TokenCounter())
         roles = [m["role"] for m in plan.messages]
         assert "assistant" in roles
         # no orphan assistant from the evicted interaction
@@ -239,7 +264,9 @@ class TestInteractionUnitTrimming:
             msg("assistant", "done"),
             msg("user", "next question"),
         ]
-        plan = plan_context(messages, tools=None, usable_budget=200, counter=TokenCounter())
+        plan = plan_context(
+            history=messages,
+            current_request=[], tools=None, usable_budget=200, counter=TokenCounter())
         selected = plan.messages
         # first turn either fully present or fully absent
         has_call = any(m.get("tool_calls") for m in selected)
@@ -257,13 +284,19 @@ class TestInteractionUnitTrimming:
     def test_current_request_never_evicted_when_history_huge(self):
         """10.9."""
         messages = [msg("user", "h" * 3000), msg("assistant", "h" * 3000), msg("user", "keep me")]
-        plan = plan_context(messages, tools=None, usable_budget=120, counter=TokenCounter())
+        plan = plan_context(
+            history=messages,
+            current_request=[], tools=None, usable_budget=120, counter=TokenCounter())
         assert plan.messages[-1]["content"] == "keep me"
 
     def test_pinned_reservation_shrinks_available_context(self):
         messages = [msg("user", "x" * 400), msg("assistant", "x" * 400), msg("user", "cur")]
-        without = plan_context(messages, tools=None, usable_budget=350, reserved_tokens=0)
-        with_res = plan_context(messages, tools=None, usable_budget=350, reserved_tokens=150)
+        without = plan_context(
+            history=messages,
+            current_request=[], tools=None, usable_budget=350, reserved_tokens=0)
+        with_res = plan_context(
+            history=messages,
+            current_request=[], tools=None, usable_budget=350, reserved_tokens=150)
         assert len(with_res.messages) <= len(without.messages)
         assert with_res.total_tokens + 150 <= 350
 
