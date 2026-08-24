@@ -77,13 +77,23 @@ jobs:
       - name: Smoke test (healthz)
         run: |
           docker run -d --name smoke -p 8080:8080 context-proxy:ci
+          trap 'docker rm -f smoke >/dev/null 2>&1 || true' EXIT
+
+          healthy=false
           for i in $(seq 1 30); do
             if curl -sf http://localhost:8080/healthz > /tmp/health.json; then
+              healthy=true
               break
             fi
             sleep 1
           done
+
+          if [ "$healthy" != "true" ]; then
+            echo "::error::Container did not become healthy within timeout"
+            docker logs smoke || true
+            exit 1
+          fi
+
           cat /tmp/health.json
           grep -q '"status": "ok"' /tmp/health.json
           curl -sf http://localhost:8080/metrics > /dev/null
-          docker rm -f smoke
