@@ -101,6 +101,69 @@ def test_diagnostics_reports_unconfigured_inference():
 # ------------------------------------------- §2 internal endpoint isolation
 
 
+class TestProductionFailClosed:
+    """Empty internal token must refuse to boot in production mode."""
+
+    def test_production_with_empty_token_is_configuration_error(self):
+        import pydantic
+
+
+        with pytest.raises(pydantic.ValidationError) as excinfo:
+            SecuritySettings(mode="production", internal_auth_token="")
+        assert "SECURITY__INTERNAL_AUTH_TOKEN" in str(excinfo.value)
+        assert "fail-closed" in str(excinfo.value)
+
+    def test_production_settings_via_real_env_path_fail_to_load(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        import pydantic
+
+        from context_proxy.config import Settings
+
+        monkeypatch.setenv("SECURITY__MODE", "production")
+        monkeypatch.delenv("SECURITY__INTERNAL_AUTH_TOKEN", raising=False)
+        with pytest.raises(pydantic.ValidationError):
+            Settings(_env_file=None)                  # real env parsing path
+
+    def test_production_with_configured_token_boots_and_enforces(self):
+        security = SecuritySettings(
+            mode="production", internal_auth_token="prod-token"
+        )
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        with _client(security) as client:
+            ok = client.post(
+                "/internal/v1/index/rebuild",
+                headers={"X-Internal-Auth": "prod-token"},
+            )
+            missing = client.get("/internal/v1/diagnostics")
+            wrong = client.get(
+                "/internal/v1/diagnostics", headers={"X-Internal-Auth": "nope"}
+            )
+            public = client.post("/v1/chat/completions", json=body)
+            diagnostics = client.get(
+                "/internal/v1/diagnostics",
+                headers={"X-Internal-Auth": "prod-token"},
+            )
+        assert ok.status_code == 503                  # router reached (no memory svc)
+        assert missing.status_code == 401
+        assert wrong.status_code == 401
+        # D: public API unaffected under production policy
+        assert public.status_code == 200
+        assert public.json() == CHAT_RESPONSE
+        # token never surfaces through diagnostics
+        assert "prod-token" not in diagnostics.text
+        assert "internal_auth_token" not in diagnostics.text
+
+    def test_development_mode_keeps_local_usable(self):
+        with _client(SecuritySettings(mode="development")) as client:
+            response = client.get("/internal/v1/diagnostics")
+        assert response.status_code == 200            # empty token, still open
+
+    def test_default_mode_is_development(self):
+        assert SecuritySettings().mode == "development"
+        assert SecuritySettings().internal_auth_token == ""
+
+
 class TestInternalAuthGate:
     def test_open_by_default_local_deployment(self):
         with _client() as client:

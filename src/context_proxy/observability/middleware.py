@@ -49,6 +49,10 @@ ROUTE_ALIASES = (
     ("/readyz", "/readyz"),
 )
 
+# Never throttled: liveness/readiness/telemetry must stay answerable even
+# while an abusive client is being shed.
+_RATE_LIMIT_EXEMPT_ROUTES = frozenset({"/healthz", "/readyz", "/metrics"})
+
 
 def current_request_id() -> str:
     return REQUEST_ID_CTX.get()
@@ -182,13 +186,29 @@ class ObservabilityMiddleware:
                              f"request body exceeds {self._max_body_bytes} bytes")
                 return
 
-            if self._rate_limit_enabled:
-                key = _header(scope, "x-conversation-id") or _client_host(scope)
-                if not self._limiter.allow(key):
+            if self._rate_limit_enabled and route not in _RATE_LIMIT_EXEMPT_ROUTES:
+                # Two-dimension admission (post-04592c0 review §2): the
+                # client/IP bucket aggregates ALL of a host's API traffic,
+                # so rotating X-Conversation-ID cannot mint fresh quota; the
+                # conversation bucket (when the header is present) keeps its
+                # per-conversation isolation. One rejection = one metric.
+                # Operational endpoints (health/metrics) are exempt: liveness
+                # must never be throttled by chat quota.
+                conversation_header = _header(scope, "x-conversation-id")
+                decision = self._limiter.admit(
+                    client_key=_client_host(scope),
+                    conversation_key=conversation_header,
+                )
+                if not decision.allowed:
                     RATE_LIMIT_REJECTS_TOTAL.inc()
-                    retry_after = str(self._limiter.retry_after(key))
+                    retry_after = str(decision.retry_after)
                     logger.warning(
-                        "rate_limited", extra={"route": route, "retry_after": retry_after}
+                        "rate_limited",
+                        extra={
+                            "route": route,
+                            "scope": decision.scope,
+                            "retry_after": retry_after,
+                        },
                     )
                     await reject(429, "rate_limit_exceeded", "rate limit exceeded",
                                  err_type="rate_limit_error",

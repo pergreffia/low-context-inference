@@ -140,6 +140,81 @@ class TestBoundedIdentities:
             RateLimiter(requests_per_minute=60, burst=1, identity_ttl_seconds=0)
 
 
+# --------------------------------------------------- two-dimension policy
+
+
+class TestTwoDimensionAdmission:
+    """Rotating X-Conversation-ID must not bypass the client-level bucket."""
+
+    def test_rotation_cannot_bypass_client_quota(self):
+        limiter, clock = make_limiter(burst=2, requests_per_minute=6)
+        outcomes = [
+            limiter.admit(client_key="10.0.0.1", conversation_key=f"conv-{i}")
+            for i in range(6)
+        ]
+        allowed = [d for d in outcomes if d.allowed]
+        rejected = [d for d in outcomes if not d.allowed]
+        assert len(allowed) == 2                      # client burst, ONCE
+        assert len(rejected) == 4
+        assert all(d.scope == "client" for d in rejected)
+        assert all(d.retry_after >= 1 for d in rejected)
+
+    def test_rotation_does_not_reset_client_bucket(self):
+        limiter, clock = make_limiter(burst=3, requests_per_minute=6)
+        for i in range(3):                            # exhaust via rotation
+            decision = limiter.admit("10.0.0.7", f"c{i}")
+            assert decision.allowed
+        # a brand-new conversation id still hits the SAME drained client bucket
+        fresh = limiter.admit("10.0.0.7", "brand-new-conversation")
+        assert fresh.allowed is False
+        assert fresh.scope == "client"
+        clock.advance(120)                            # full refill @0.1/s -> burst back
+        assert limiter.admit("10.0.0.7", "another-new").allowed is True
+
+    def test_conversation_bucket_still_isolates_identities(self):
+        limiter, _clock = make_limiter(burst=1, requests_per_minute=6)
+        # same conversation from DIFFERENT clients: conv bucket shared
+        first = limiter.admit("10.0.0.1", "conv-shared")
+        second = limiter.admit("10.0.0.2", "conv-shared")
+        assert first.allowed and second.allowed is False
+        assert second.scope == "conversation"
+        # different conversations from different clients: fully independent
+        assert limiter.admit("10.0.0.3", "conv-x").allowed
+        assert limiter.admit("10.0.0.4", "conv-y").allowed
+
+    def test_no_conversation_header_checks_client_only(self):
+        limiter, _clock = make_limiter(burst=1, requests_per_minute=6)
+        assert limiter.admit("10.0.0.9").allowed
+        denied = limiter.admit("10.0.0.9")
+        assert denied.allowed is False and denied.scope == "client"
+
+    def test_rejected_attempt_consumes_passing_dimension(self):
+        """Hammering loophole closed: alternating identities stay throttled."""
+        limiter, clock = make_limiter(burst=2, requests_per_minute=6)
+        assert limiter.admit("ip", "a").allowed       # client 2 left, conv-a 0
+        assert limiter.admit("ip", "b").allowed       # client 1 left
+        # conv-a refilled by now? No — but the point: each attempt burns a
+        # client token even when the conversation bucket rejects.
+        clock.advance(60)                             # ~6 tokens back on both dims
+        burned = [limiter.admit("ip", f"k{i}") for i in range(8)]
+        allowed = sum(1 for d in burned if d.allowed)
+        assert allowed <= 2                           # client cap held overall
+
+    def test_memory_bound_holds_across_both_dimensions(self):
+        limiter, _clock = make_limiter(
+            max_identities=16, identity_ttl_seconds=10_000
+        )
+        for i in range(500):
+            limiter.admit(f"host-{i % 7}", f"rotating-{i}")   # many conversations
+        assert limiter.identity_count() <= 16         # ONE table, both namespaces
+
+    def test_legacy_allow_and_retry_after_compat(self):
+        limiter, _clock = make_limiter(burst=1, requests_per_minute=6)
+        assert limiter.allow("solo") is True
+        assert limiter.allow("solo") is False
+        assert limiter.retry_after("solo") >= 1
+
+
 # -------------------------------------------------------------- route level
 
 
@@ -235,3 +310,47 @@ class TestRouteLevelBoundedRateLimit:
         if response.status_code == 400:
             assert response.json()["error"]["code"] == "invalid_conversation_id"
         assert app.state.rate_limiter.identity_count() <= 4
+
+    def test_rotation_cannot_bypass_client_quota_route_level(self):
+        """Same client rotating conversation ids: 429 after the client burst."""
+        REGISTRY.reset()
+        before = _reject_metric_value()
+        app = _app_with_rate_limits()                 # burst=3
+        with TestClient(app) as client:               # all from one client host
+            statuses = []
+            for i in range(8):
+                conv = f"00000000-0000-0000-0000-{i:012d}"
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+                    headers={"X-Conversation-ID": conv},
+                )
+                statuses.append(response.status_code)
+        assert statuses[:3] == [200, 200, 200]        # client burst admitted once
+        assert set(statuses[3:]) == {429}             # rotation buys NOTHING
+
+        rejected = statuses[3:].count(429)
+        after = _reject_metric_value()
+        assert after - before == rejected            # exactly one metric per reject
+
+        last = client.post(                           # Retry-After contract
+            "/v1/chat/completions",
+            json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Conversation-ID": "00000000-0000-0000-0000-999999999999"},
+        )
+        assert last.status_code == 429
+        error = last.json()["error"]
+        assert error["code"] == "rate_limit_exceeded"
+        assert error["type"] == "rate_limit_error"
+        retry_after = int(last.headers["Retry-After"])
+        assert retry_after >= 1
+
+
+def _reject_metric_value() -> int:
+    text = REGISTRY.render()
+    line = next(
+        (ln for ln in text.splitlines()
+         if ln.startswith("context_proxy_rate_limit_rejects_total")),
+        None,
+    )
+    return int(line.rsplit(" ", 1)[1]) if line else 0

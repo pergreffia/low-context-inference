@@ -712,7 +712,11 @@ class TestRateLimiterIdentityPolicy:
             )
         assert first.status_code == 200
         assert second.status_code == 429  # bucket A exhausted...
-        assert other.status_code == 200   # ...bucket B untouched
+        # post-04592c0 review §2: rotation can NO LONGER mint fresh quota —
+        # the shared client/IP bucket aggregates both attempts, so a new
+        # conversation id from the same host is throttled too.
+        assert other.status_code == 429
+        assert other.headers.get("Retry-After") is not None
 
 
 class TestTokenAccountingStreamingWithStore:

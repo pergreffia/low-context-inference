@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -142,11 +143,27 @@ class SecuritySettings(BaseModel):
     `/internal/*` is administrative and must sit on a private network; the
     URL prefix alone is not a security mechanism. When `internal_auth_token`
     is non-empty, every /internal/* request must present it in the
-    X-Internal-Auth header. Empty (default) keeps local development open —
-    the real boundary remains the network.
+    X-Internal-Auth header.
+
+    Fail-closed production policy (post-04592c0 review §1): with
+    `mode="production"` an empty token is a CONFIGURATION error — the proxy
+    refuses to start rather than silently exposing diagnostics/index-rebuild
+    on an internet-facing port. `mode="development"` (default) keeps local
+    and test deployments friction-free.
     """
 
+    mode: Literal["development", "production"] = "development"
     internal_auth_token: str = ""
+
+    @model_validator(mode="after")
+    def _production_requires_internal_auth(self) -> SecuritySettings:
+        if self.mode == "production" and not self.internal_auth_token:
+            raise ValueError(
+                "SECURITY__INTERNAL_AUTH_TOKEN must be configured when "
+                "SECURITY__MODE=production: refusing to expose /internal/* "
+                "without authentication (fail-closed policy)"
+            )
+        return self
 
 
 class ContextSettings(BaseModel):
