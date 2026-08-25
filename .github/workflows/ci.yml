@@ -101,3 +101,22 @@ jobs:
           cat /tmp/health.json
           grep -Eq '"status": ?"ok"' /tmp/health.json
           curl -sf http://localhost:8080/metrics > /dev/null
+
+  security-scan:
+    # Dependency vulnerability gate (post-0876b10 review §14): fails on any
+    # known CVE in the locked environment. Policy: all findings block; add
+    # `--ignore-vuln ID` here ONLY with a dated justification comment.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies (locked via constraints.txt)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]" -c constraints.txt
+      - name: pip-audit (locked environment)
+        # --skip-editable: the local context-proxy distribution is not a
+        # PyPI package; everything else is audited against the advisory DB.
+        run: python -m pip_audit --strict --skip-editable

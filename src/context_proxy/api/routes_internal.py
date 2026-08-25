@@ -4,17 +4,27 @@ Typed request/response schemas; local infrastructure surface — not part of
 the public OpenAI-compatible contract. All identifiers are validated as UUIDs
 so malformed input yields controlled 400s instead of raw database errors.
 
-INTERNAL-ONLY (M5 review §5): this router is administrative. `/index/rebuild`
-in particular can consume significant embedding/Qdrant resources. It MUST be
-exposed exclusively on the internal network (do not publish through public
-ingress); no authentication framework is included in M5 by design.
+INTERNAL-ONLY (M5 review §5; post-0876b10 review §2): this router is
+administrative. `/index/rebuild` in particular can consume significant
+embedding/Qdrant resources. Deployment boundary:
+
+    public ingress  -> /v1/*          (OpenAI-compatible surface)
+    private network -> /internal/*    (this router)
+
+The URL prefix alone is NOT a security mechanism. When
+SECURITY__INTERNAL_AUTH_TOKEN is configured, every /internal/* request must
+present it via the X-Internal-Auth header (401 otherwise). An empty token
+keeps unauthenticated local development working — the real boundary remains
+the private network.
 """
 
 from __future__ import annotations
 
+import hmac
 import uuid
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from context_proxy.api.validation import (
@@ -35,6 +45,25 @@ from context_proxy.memory.models import (
 )
 
 router = APIRouter(prefix="/internal/v1")
+
+INTERNAL_AUTH_HEADER = "x-internal-auth"
+
+
+async def require_internal_auth(request: Request) -> None:
+    """Configurable application-level gate for the administrative surface.
+
+    Token unset -> allow (local deployment, network provides the boundary).
+    Token set   -> constant-time comparison against X-Internal-Auth.
+    """
+    expected = request.app.state.settings.security.internal_auth_token
+    if not expected:
+        return
+    presented = request.headers.get(INTERNAL_AUTH_HEADER)
+    if presented is None or not hmac.compare_digest(presented, expected):
+        raise HTTPException(status_code=401, detail="internal endpoint requires authentication")
+
+
+router.dependencies = [Depends(require_internal_auth)]  # type: ignore[assignment]
 
 
 class ContextPreviewRequest(BaseModel):
@@ -113,6 +142,24 @@ async def rebuild_index(request: Request, conversation_id: str | None = None, fo
     return {"status": "ok", **summary}
 
 
+def _sanitized_endpoint(url: str) -> dict:
+    """Host/port only — NEVER the full URL.
+
+    base_url may embed credentials (`https://user:secret@host/v1`) or carry
+    secrets in the query/fragment (`?api_key=...`, `#token`). Diagnostics
+    expose just configured/host/port; username, password, path, query and
+    fragment are dropped.
+    """
+    if not url:
+        return {"configured": False, "host": None, "port": None}
+    parsed = urlsplit(url)
+    return {
+        "configured": True,
+        "host": parsed.hostname,
+        "port": parsed.port,
+    }
+
+
 @router.get("/diagnostics")
 async def diagnostics(request: Request):
     """Operational snapshot (M5). Never includes secrets or raw content."""
@@ -145,8 +192,12 @@ async def diagnostics(request: Request):
         "rate_limit": {
             "enabled": settings.rate_limit.enabled,
             "requests_per_minute": settings.rate_limit.requests_per_minute,
+            # Live bucket count — bounded by RATE_LIMIT__MAX_IDENTITIES.
+            "live_identities": getattr(
+                getattr(app_state, "rate_limiter", None), "identity_count", lambda: 0
+            )(),
         },
-        "inference": {"base_url": settings.inference.base_url},
+        "inference": _sanitized_endpoint(settings.inference.base_url),
     }
 
 

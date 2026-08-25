@@ -49,6 +49,9 @@ def create_app(
     rate_limiter = RateLimiter(
         requests_per_minute=settings.rate_limit.requests_per_minute,
         burst=settings.rate_limit.burst,
+        max_identities=settings.rate_limit.max_identities,
+        identity_ttl_seconds=settings.rate_limit.identity_ttl_seconds,
+        max_identity_chars=settings.rate_limit.max_identity_chars,
     )
 
     @asynccontextmanager
@@ -130,6 +133,8 @@ def create_app(
 
     app = FastAPI(title="Context Proxy", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
+    # Exposed for diagnostics/observability (bounded-memory contract).
+    app.state.rate_limiter = rate_limiter
     if llm_client is None:
         # Application-owned inference client: closed on shutdown (M6 review).
         llm_client = httpx.AsyncClient(

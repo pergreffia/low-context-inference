@@ -117,6 +117,12 @@ class RateLimitSettings(BaseModel):
     X-Conversation-ID gets fresh buckets — the limiter guarantees per-identity
     fairness, not abuse-proof global quota.
 
+    Bounded memory (post-0876b10 review §1): client-controlled identity
+    cardinality is capped. `max_identities` limits live buckets (LRU eviction
+    at capacity), `identity_ttl_seconds` drops idle buckets, and identities
+    longer than `max_identity_chars` are truncated. Worst-case memory is
+    therefore O(max_identities) no matter what clients send.
+
     Single-instance scope (§2.6): with SERVER__WEB_CONCURRENCY > 1 each
     worker process keeps its own buckets — limits are effectively multiplied
     by the worker count.
@@ -125,6 +131,22 @@ class RateLimitSettings(BaseModel):
     enabled: bool = False
     requests_per_minute: int = Field(default=120, gt=0)
     burst: int = Field(default=30, gt=0)
+    max_identities: int = Field(default=10_000, ge=1)
+    identity_ttl_seconds: float = Field(default=3600.0, gt=0)
+    max_identity_chars: int = Field(default=256, ge=1)
+
+
+class SecuritySettings(BaseModel):
+    """Deployment-boundary configuration (post-0876b10 review §2).
+
+    `/internal/*` is administrative and must sit on a private network; the
+    URL prefix alone is not a security mechanism. When `internal_auth_token`
+    is non-empty, every /internal/* request must present it in the
+    X-Internal-Auth header. Empty (default) keeps local development open —
+    the real boundary remains the network.
+    """
+
+    internal_auth_token: str = ""
 
 
 class ContextSettings(BaseModel):
@@ -170,6 +192,7 @@ class Settings(BaseSettings):
     memory: MemorySettings = MemorySettings()
     resilience: ResilienceSettings = ResilienceSettings()
     rate_limit: RateLimitSettings = RateLimitSettings()
+    security: SecuritySettings = SecuritySettings()
     compact: EndpointSettings = EndpointSettings(
         base_url="http://localhost:8001/v1",
         api_key="local",

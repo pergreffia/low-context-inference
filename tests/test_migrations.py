@@ -227,6 +227,7 @@ def test_concurrent_startup_applies_each_exactly_once():
                 "0009_conversation_media.sql",
                 "0010_media_source_size.sql",
                 "0011_developer_role.sql",
+                "0012_tool_call_types.sql",
             }
             # every migration applied exactly once across both runners
             assert len(names) == len(set(names))
@@ -273,7 +274,7 @@ def test_migrations_from_clean_database_create_full_m3_schema():
                 await pool.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
 
             completed = await apply_migrations(pool)
-            assert len(completed) == 11
+            assert len(completed) == 12
 
             cols = await pool.fetch(
                 """

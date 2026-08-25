@@ -2,6 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Runtime hygiene: no .pyc writes into a (potentially read-only) image
+# filesystem, unbuffered stdout for log shippers.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 COPY pyproject.toml constraints.txt ./
 COPY src ./src
 

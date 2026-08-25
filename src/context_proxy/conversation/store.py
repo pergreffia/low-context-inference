@@ -180,18 +180,46 @@ class PostgresConversationStore:
         message_id,
         message: dict[str, Any],
     ) -> None:
+        """Relational projection of assistant tool_calls + tool results.
+
+        Supports function AND custom calls (post-0876b10 review §6); unknown
+        call shapes keep their extra transport fields verbatim in `extra`.
+        Purely a projection — the raw message in messages.jsonb is never
+        touched and remains the source of truth.
+        """
         for tool_call in message.get("tool_calls") or []:
-            function = tool_call.get("function") or {}
+            call_type = tool_call.get("type")
+            if call_type is None:
+                call_type = "custom" if "custom" in tool_call else "function"
+            if call_type == "custom":
+                custom = tool_call.get("custom") or {}
+                name = custom.get("name")
+                arguments = None
+                call_input = json.dumps(custom.get("input"), ensure_ascii=False)
+            else:
+                function = tool_call.get("function") or {}
+                name = function.get("name")
+                arguments = json.dumps(function.get("arguments"), ensure_ascii=False)
+                call_input = None
+            extra = {
+                key: value
+                for key, value in tool_call.items()
+                if key not in ("id", "type", "function", "custom")
+            }
             await conn.execute(
                 """
-                INSERT INTO tool_calls (message_id, tool_call_id, name, arguments)
-                VALUES ($1, $2, $3, $4::jsonb)
+                INSERT INTO tool_calls (message_id, tool_call_id, call_type,
+                                        name, arguments, input, extra)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb)
                 ON CONFLICT (message_id, tool_call_id) DO NOTHING
                 """,
                 message_id,
                 tool_call.get("id"),
-                function.get("name"),
-                json.dumps(function.get("arguments"), ensure_ascii=False),
+                str(call_type),
+                name,
+                arguments,
+                call_input,
+                json.dumps(extra, ensure_ascii=False),
             )
         if message.get("role") == "tool" and message.get("tool_call_id"):
             # Association rule: newest matching call within the SAME

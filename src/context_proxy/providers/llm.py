@@ -22,6 +22,12 @@ from context_proxy.providers.resilience import CircuitBreaker, with_retries
 
 logger = logging.getLogger(__name__)
 
+# Retryable transport failures (post-0876b10 review §3): ONLY errors that are
+# provably pre-send. A POST whose request may already have been delivered and
+# accepted (ReadTimeout, WriteError, RemoteProtocolError, ...) must NEVER be
+# retried — a second attempt could duplicate the inference.
+RETRYABLE_TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
+
 
 class OpenAICompatibleLLMProvider:
     """Thin passthrough client for any OpenAI-compatible endpoint.
@@ -116,10 +122,15 @@ class OpenAICompatibleLLMProvider:
         """Send with breaker + bounded transport retries (M5).
 
         A fresh request is built per attempt: httpx requests are not safely
-        reusable after a send. The breaker fails fast while OPEN. Only
-        transport-level errors reach retry/breaker accounting; an HTTP
-        response — even 5xx — proves the endpoint answered and closes the
-        breaker.
+        reusable after a send. The breaker fails fast while OPEN.
+
+        Retry/breaker policy (post-0876b10 review §3): only provably pre-send
+        failures (ConnectError/ConnectTimeout) are retried and counted as
+        breaker failures. Any other transport error — ReadTimeout, WriteError,
+        RemoteProtocolError, ... — may have reached the provider already, so
+        it is NEVER retried and does NOT trip the breaker; it still surfaces
+        to the client as the standard upstream-unavailable contract. An HTTP
+        response — even 5xx — is an answer and closes the breaker.
         """
         import time as _time
 
@@ -152,13 +163,27 @@ class OpenAICompatibleLLMProvider:
                 max_retries=settings.max_retries,
                 backoff_base_seconds=settings.backoff_base_seconds,
                 backoff_max_seconds=settings.backoff_max_seconds,
-                retry_on=(httpx.HTTPError,),
+                retry_on=RETRYABLE_TRANSPORT_ERRORS,
             )
-        except httpx.HTTPError as exc:
+        except RETRYABLE_TRANSPORT_ERRORS as exc:
+            # Provably never delivered: safe to count against the breaker.
             self._breaker.record_failure()
             logger.warning(
-                "upstream_transport_failed",
+                "upstream_connect_failed",
                 extra={"error": str(exc), "attempts": settings.max_retries + 1},
+            )
+            raise map_upstream_error(exc) from exc
+        except httpx.HTTPError as exc:
+            # Post-send failure: a retry could duplicate the POST. No breaker
+            # accounting either — the endpoint answered the dial, the problem
+            # happened later on THIS request.
+            logger.warning(
+                "upstream_transport_failed_no_retry",
+                extra={
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "attempts": 1,
+                },
             )
             raise map_upstream_error(exc) from exc
 

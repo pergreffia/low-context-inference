@@ -277,6 +277,13 @@ RATE_LIMIT_REJECTS_TOTAL: Counter = REGISTRY.register(
         "Requests rejected by the local rate limiter.",
     )
 )
+RATE_LIMIT_EVICTED_TOTAL: Counter = REGISTRY.register(
+    Counter(
+        "context_proxy_rate_limit_identities_evicted_total",
+        "Rate-limiter identity buckets removed by TTL expiry or capacity "
+        "eviction (bounded-memory contract).",
+    )
+)
 ASSISTANT_CAPTURE_OVERFLOW_TOTAL: Counter = REGISTRY.register(
     Counter(
         "context_proxy_assistant_capture_overflow_total",

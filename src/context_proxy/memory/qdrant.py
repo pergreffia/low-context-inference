@@ -45,7 +45,16 @@ class QdrantVectorStore:
 
         Cached after first success; concurrent callers are serialized by an
         asyncio lock and reuse the result.
+
+        Compatibility gate (post-0876b10 review §4): a 409 Conflict only
+        proves SOME collection exists — not that it matches THIS embedding
+        model. On 409 the live config is fetched and compared (vector size,
+        distance). Incompatible collections raise an explicit error: never a
+        silent delete, never an automatic recreate (the index is derived, but
+        destroying data on config drift must stay a deliberate operator
+        action).
         """
+        expected = {"size": vector_size, "distance": "Cosine"}
         async with self._ensure_lock:
             if self._collection_ready:
                 return
@@ -53,9 +62,52 @@ class QdrantVectorStore:
                 f"/collections/{self._collection}",
                 json={"vectors": {"size": vector_size, "distance": "Cosine"}},
             )
-            if response.status_code not in (200, 409):
+            if response.status_code == 409:
+                actual = await self._fetch_collection_params()
+                if actual != expected:
+                    raise VectorStoreError(
+                        f"qdrant collection '{self._collection}' exists with "
+                        f"incompatible configuration: expected "
+                        f"size={expected['size']} distance={expected['distance']}, "
+                        f"found size={actual.get('size')} distance={actual.get('distance')}; "
+                        "refusing to overwrite — migrate or delete it explicitly"
+                    )
+                self._collection_ready = True
+                return
+            if response.status_code not in (200, 201):
                 response.raise_for_status()
             self._collection_ready = True
+
+    async def _fetch_collection_params(self) -> dict[str, Any]:
+        """GET the existing collection's vector params; error is explicit."""
+        try:
+            response = await self._client.get(f"/collections/{self._collection}")
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise VectorStoreError(
+                f"qdrant collection '{self._collection}' conflict check failed: {exc}",
+                cause=exc,
+            ) from exc
+        result = body.get("result") if isinstance(body, dict) else None
+        params = (
+            result.get("config", {}).get("params", {}).get("vectors", {})
+            if isinstance(result, dict)
+            else {}
+        )
+        if isinstance(params, dict):
+            size = params.get("size")
+            distance = params.get("distance")
+        else:
+            # Named-vectors layouts are unsupported by this store; treat any
+            # non-{size,distance} shape as incompatible rather than guessing.
+            size, distance = None, None
+        if not isinstance(size, int) or not isinstance(distance, str):
+            raise VectorStoreError(
+                f"qdrant collection '{self._collection}' reports no plain "
+                f"single-vector configuration; refusing to guess compatibility"
+            )
+        return {"size": size, "distance": distance}
 
     async def upsert(
         self,
