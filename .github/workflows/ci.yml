@@ -1,5 +1,9 @@
 name: CI
 
+# Standard CI is DETERMINISTIC by design (post-0d331f9 review §6): no Ollama,
+# GPU, Bonsai, or model-dependent behavior. Real-provider validation runs
+# manually/pre-release only:
+#   BASE_MODEL=MichelRosselli/bonsai-27b:latest ./scripts/e2e_real_provider.sh
 on:
   push:
   pull_request:
