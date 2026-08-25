@@ -110,7 +110,8 @@ response bodies are never rewritten.
   `POST /internal/v1/index/rebuild` (rebuilds from PostgreSQL).
 - **Monitoring**: scrape `/metrics` (Prometheus text format); watch request
   counters/latency, breaker gauge, degradation/capture-overflow/rate-limit
-  counters. See [operations.md](operations.md).
+  counters. `/metrics` has no application-level authentication — restrict it
+  at the ingress/network layer. See [operations.md](operations.md).
 - **Workers**: `SERVER__WEB_CONCURRENCY=N` scales uvicorn workers; metrics
   and rate buckets are per-worker (documented consequence).
 

@@ -76,6 +76,14 @@ Details: [docs/architecture.md](docs/architecture.md)
 | Security | internal auth policy, two-dimension rate limit, redaction | [security.md](docs/security.md) |
 | Ops | health/readiness/metrics/diagnostics, degraded modes | [operations.md](docs/operations.md) |
 
+> **Production exposure warning.** Do not expose `/internal/*` or `/metrics`
+> to untrusted networks. Protect both with network/ingress ACLs.
+> `/internal/*` is an administrative surface: in production mode it also
+> requires `SECURITY__INTERNAL_AUTH_TOKEN` (the proxy refuses to start
+> without it). `/metrics` has **no application-level authentication** —
+> network controls are its only protection. Details:
+> [security.md](docs/security.md) · [deployment.md](docs/deployment.md).
+
 ## Quick start
 
 ### Run from source (development)
@@ -87,8 +95,11 @@ cp .env.example .env          # point INFERENCE__BASE_URL at your provider
 uvicorn context_proxy.main:app --host 127.0.0.1 --port 8080
 ```
 
-PostgreSQL is optional locally: when unreachable the proxy serves pure
-passthrough and reports `database: degraded`.
+PostgreSQL is required for full functionality (conversation persistence,
+history consistency, memory). When it is unavailable the proxy intentionally
+keeps serving requests in degraded passthrough mode — nothing is persisted
+and `healthz` reports `database: degraded`. Passthrough is a resilience
+feature, not a substitute for a deployment without PostgreSQL.
 
 ### Docker Compose
 

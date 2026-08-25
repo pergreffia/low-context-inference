@@ -153,7 +153,7 @@ same process resumes serving (covered by regression tests).
 | Symptom | Likely cause / action |
 |---|---|
 | `502 upstream_unavailable` on every call | provider down or wrong `INFERENCE__BASE_URL`; check provider, breaker gauge; breaker self-recovers after reset window |
-| `400 history_conflict` | client resent a divergent history for that conversation; fix client transcript or use a new conversation id |
+| `409 history_conflict` | client resent a divergent history for that conversation; fix client transcript or use a new conversation id |
 | `400 context_length_exceeded` | mandatory content (system/tools/current) alone exceeds budget; raise `CONTEXT__MODEL_LIMIT_TOKENS` to match the real model or shrink tools |
 | `413` on upload | body > `SERVER__MAX_BODY_BYTES`; raise limit or shrink payload |
 | `409`/`422` unexpected shapes | structural validation; see [api.md](api.md#errors) |
