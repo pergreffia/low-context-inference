@@ -117,6 +117,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]" -c constraints.txt
       - name: pip-audit (locked environment)
-        # --skip-editable: the local context-proxy distribution is not a
-        # PyPI package; everything else is audited against the advisory DB.
-        run: python -m pip_audit --strict --skip-editable
+        # Audit the full frozen environment minus the local editable
+        # distribution (not a PyPI package, nothing to audit).
+        run: |
+          python -m pip freeze | grep -v "^-e " | grep -v "^context-proxy" > /tmp/audit-requirements.txt
+          python -m pip_audit --strict -r /tmp/audit-requirements.txt
