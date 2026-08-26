@@ -148,9 +148,9 @@ class SecuritySettings(BaseModel):
     """Deployment-boundary configuration (post-0876b10 review §2).
 
     `/internal/*` is administrative and must sit on a private network; the
-    URL prefix alone is not a security mechanism. When `internal_auth_token`
-    is non-empty, every /internal/* request must present it in the
-    X-Internal-Auth header.
+    URL prefix alone is not a security mechanism. When
+    `internal_auth_token` is non-empty, every /internal/* request must present
+    it in the X-Internal-Auth header.
 
     Fail-closed production policy (post-04592c0 review §1): with
     `mode="production"` an empty token is a CONFIGURATION error — the proxy
@@ -203,6 +203,11 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
         env_file=".env",
         extra="ignore",
+        # Preserve defaults of nested BaseModel fields when an environment
+        # variable overrides only one member of the nested model. Without this,
+        # e.g. EMBEDDINGS__API_KEY replaces the entire ModelEndpointSettings
+        # value and makes its required `model` field appear missing.
+        nested_model_default_partial_update=True,
     )
 
     server: ServerSettings = ServerSettings()
