@@ -91,3 +91,25 @@ def test_inference_settings_have_no_model_configuration() -> None:
     assert not hasattr(settings.inference, "model")
     assert settings.embeddings.model == "embedding-model"
     assert settings.compact.model == "compact-model"
+
+
+def test_embedding_nested_env_override_preserves_other_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EMBEDDINGS__API_KEY", "test-secret")
+
+    settings = Settings()
+
+    assert settings.embeddings.api_key == "test-secret"
+    assert settings.embeddings.base_url == "http://localhost:8002/v1"
+    assert settings.embeddings.model == "embedding-model"
+    assert settings.embeddings.timeout_seconds == 600.0
+
+
+def test_compact_nested_env_override_preserves_other_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COMPACT__API_KEY", "test-secret")
+
+    settings = Settings()
+
+    assert settings.compact.api_key == "test-secret"
+    assert settings.compact.base_url == "http://localhost:8001/v1"
+    assert settings.compact.model == "compact-model"
+    assert settings.compact.timeout_seconds == 600.0
