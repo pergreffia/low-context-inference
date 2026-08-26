@@ -22,11 +22,7 @@ class ServerSettings(BaseModel):
 
 
 class EndpointSettings(BaseModel):
-    """Endpoint configuration for inference providers.
-
-    The inference model is deliberately NOT configured here: the client owns
-    model selection and sends the `model` field on every inference request.
-    """
+    """Generic endpoint settings; inference model selection is client-owned."""
 
     base_url: str = "http://localhost:8000/v1"
     api_key: str = ""
@@ -34,9 +30,9 @@ class EndpointSettings(BaseModel):
 
 
 class ModelEndpointSettings(EndpointSettings):
-    """Endpoint configuration for a system-owned model (embeddings/compact)."""
+    """Endpoint settings for internally model-selected services."""
 
-    model: str | None = None
+    model: str
 
 
 class DatabaseSettings(BaseModel):
