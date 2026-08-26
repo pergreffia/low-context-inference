@@ -57,7 +57,10 @@ def equivalent(a: dict[str, Any], b: dict[str, Any]) -> bool:
     if left.get("role") == right.get("role") == "tool":
         if left.get("tool_call_id") != right.get("tool_call_id"):
             return False
-        return left.get("content") == PRUNED_TOOL_RESULT or right.get("content") == PRUNED_TOOL_RESULT
+        return (
+            left.get("content") == PRUNED_TOOL_RESULT
+            or right.get("content") == PRUNED_TOOL_RESULT
+        )
 
     return False
 
