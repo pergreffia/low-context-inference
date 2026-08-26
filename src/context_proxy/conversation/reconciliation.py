@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from typing import Any
 
 
+PRUNED_TOOL_RESULT = "[Old tool result content cleared]"
+
+
 @dataclass(frozen=True)
 class ReconciliationResult:
     """Result of reconciling a client history projection."""
@@ -30,12 +33,7 @@ def _text_content(value: Any) -> str | None:
 
 
 def canonical_message(message: dict[str, Any]) -> dict[str, Any]:
-    """Canonicalize only known representation-level differences.
-
-    Reasoning is intentionally not part of conversation identity: providers and
-    clients may normalize, omit, or reconstruct it. Text scalar/content-parts
-    are canonicalized to the same text. Other fields remain significant.
-    """
+    """Canonicalize only known representation-level differences."""
     result = dict(message)
     for key in ("reasoning_content", "reasoning", "reasoning_text"):
         result.pop(key, None)
@@ -46,7 +44,22 @@ def canonical_message(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def equivalent(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    return canonical_message(a) == canonical_message(b)
+    """Compare messages using explicit client-projection normalization."""
+    left = canonical_message(a)
+    right = canonical_message(b)
+    if left == right:
+        return True
+
+    # OpenCode may prune a completed tool output while retaining the structured
+    # tool result and tool_call_id. The placeholder is a deliberate projection
+    # marker, not new conversation content. Match it only to the same tool call;
+    # unknown tool IDs remain conflicts.
+    if left.get("role") == right.get("role") == "tool":
+        if left.get("tool_call_id") != right.get("tool_call_id"):
+            return False
+        return left.get("content") == PRUNED_TOOL_RESULT or right.get("content") == PRUNED_TOOL_RESULT
+
+    return False
 
 
 def _is_compaction_summary(message: dict[str, Any]) -> bool:
@@ -109,13 +122,7 @@ def _anchor_before_tail(
     *,
     max_scan: int = 128,
 ) -> tuple[int, int, int] | None:
-    """Find a persisted suffix anchor occurring before a new incoming tail.
-
-    Returns (persisted_start, incoming_start, incoming_end). The bounded scan
-    is only used after prefix mismatch, so the normal replay/append path stays
-    linear. A compaction summary is required by the caller before accepting the
-    anchor, preventing arbitrary rewrites from being treated as projections.
-    """
+    """Find a persisted suffix anchor occurring before a new incoming tail."""
     if prefix >= len(incoming) or prefix >= len(persisted):
         return None
     persisted_end = len(persisted)
