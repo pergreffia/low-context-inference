@@ -17,6 +17,7 @@ is preserved (source of truth), never attached to an unrelated call, and an
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any
@@ -26,19 +27,68 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 
+def _message_fingerprint(message: dict[str, Any]) -> str:
+    """Deterministic, content-hiding diagnostic hash (sha256, first 16 hex).
+
+    Serialization is canonical (sorted keys, compact separators) so equal
+    messages always produce equal fingerprints. Hashes let operators tell
+    'same message replayed' apart from 'actually different' without ever
+    exposing prompts, responses or tool arguments in logs/errors.
+    """
+    canonical = json.dumps(
+        message, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+_MISSING = object()
+
+
+def _differing_fields(persisted: dict[str, Any], incoming: dict[str, Any]) -> list[str]:
+    """Top-level keys whose values differ (names only — never values)."""
+    union = set(persisted) | set(incoming)
+    return sorted(
+        key
+        for key in union
+        if persisted.get(key, _MISSING) != incoming.get(key, _MISSING)
+    )
+
+
 class HistoryDivergenceError(Exception):
     """Incoming history conflicts with persisted history at some index.
 
     The database is left untouched; the caller must reject the request
     (master prompt: raw history is the source of truth and is never rewritten).
+    Diagnostics carry deterministic fingerprints and differing top-level field
+    NAMES only — never message contents.
     """
 
-    def __init__(self, conversation_id: str, index: int):
+    def __init__(
+        self,
+        conversation_id: str,
+        index: int,
+        *,
+        persisted: dict[str, Any] | None = None,
+        incoming: dict[str, Any] | None = None,
+    ):
         self.conversation_id = conversation_id
         self.index = index
+        self.persisted_hash: str | None = None
+        self.incoming_hash: str | None = None
+        self.different_fields: list[str] = []
+        suffix = ""
+        if persisted is not None and incoming is not None:
+            self.persisted_hash = _message_fingerprint(persisted)
+            self.incoming_hash = _message_fingerprint(incoming)
+            self.different_fields = _differing_fields(persisted, incoming)
+            suffix = (
+                f" [persisted_sha256={self.persisted_hash} "
+                f"incoming_sha256={self.incoming_hash} "
+                f"different_fields={self.different_fields}]"
+            )
         super().__init__(
             f"conversation {conversation_id}: incoming message {index} "
-            f"diverges from persisted history"
+            f"diverges from persisted history{suffix}"
         )
 
 
@@ -119,7 +169,12 @@ class PostgresConversationStore:
                 overlap = min(len(persisted), len(messages))
                 for index in range(overlap):
                     if persisted[index] != messages[index]:
-                        raise HistoryDivergenceError(conversation_id, index)
+                        raise HistoryDivergenceError(
+                            conversation_id,
+                            index,
+                            persisted=persisted[index],
+                            incoming=messages[index],
+                        )
                 suffix = messages[len(persisted):]
                 if not suffix:
                     return []

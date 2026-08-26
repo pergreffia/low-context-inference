@@ -23,6 +23,15 @@ from context_proxy.providers.base import LLMStream
 
 logger = logging.getLogger(__name__)
 
+# Provider-specific assistant reasoning fields preserved verbatim during
+# streaming reconstruction (OpenCode compatibility fix): Ollama/bonsai emits
+# `reasoning`, DeepSeek-style providers emit `reasoning_content`, some emit
+# `reasoning_text`. Each key actually seen on the wire is accumulated in
+# arrival order and re-emitted under its ORIGINAL name — renaming would break
+# strict positional history reconciliation when clients replay the provider's
+# own response shape. Keys never seen are never invented.
+_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_text")
+
 
 class AssistantCapture:
     """Reconstructs OpenAI semantic state from streamed SSE chunks.
@@ -38,6 +47,7 @@ class AssistantCapture:
         "_role",
         "_content_parts",
         "_refusal_parts",
+        "_reasoning_parts",
         "_tool_calls",
         "_finish_reason",
         "_usage",
@@ -52,6 +62,7 @@ class AssistantCapture:
         self._role: str | None = None
         self._content_parts: list[str] = []
         self._refusal_parts: list[str] = []
+        self._reasoning_parts: dict[str, list[str]] = {}
         self._tool_calls: dict[int, dict[str, Any]] = {}
         self._finish_reason: str | None = None
         self._usage: dict[str, Any] | None = None
@@ -128,6 +139,10 @@ class AssistantCapture:
             self._content_parts.append(delta["content"])
         if delta.get("refusal"):
             self._refusal_parts.append(delta["refusal"])
+        for key in _REASONING_KEYS:
+            value = delta.get(key)
+            if isinstance(value, str) and value:
+                self._reasoning_parts.setdefault(key, []).append(value)
         for tool_call in delta.get("tool_calls") or []:
             index = tool_call.get("index", 0)
             slot = self._tool_calls.setdefault(index, {})
@@ -196,6 +211,12 @@ class AssistantCapture:
             "role": self._role or "assistant",
             "content": content,
         }
+        # Reasoning fields re-emitted under their ORIGINAL provider key, in
+        # arrival order (sorted keys keep multi-key output deterministic).
+        for key in sorted(self._reasoning_parts):
+            joined = "".join(self._reasoning_parts[key])
+            if joined:
+                message[key] = joined
         if tool_calls:
             message["tool_calls"] = tool_calls
         if refusal:
