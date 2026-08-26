@@ -63,14 +63,16 @@ def _is_compaction_summary(message: dict[str, Any]) -> bool:
     text = _text_content(message.get("content"))
     if not text:
         return False
-    required = (
-        "## Objective",
-        "## Important Details",
-        "## Work State",
-        "## Next Move",
-        "## Relevant Files",
+
+    # OpenCode converts a completed compaction into a model-visible summary
+    # with this stable wrapper. Match the wrapper rather than depending on the
+    # LLM-generated summary headings, which can change between versions.
+    return (
+        "The conversation history before this point was compacted into the following summary:"
+        in text
+        and "<summary>" in text
+        and "</summary>" in text
     )
-    return all(marker in text for marker in required)
 
 
 def _prefix_len(persisted: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> int:
