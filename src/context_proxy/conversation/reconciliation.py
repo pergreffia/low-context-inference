@@ -1,14 +1,4 @@
-"""Projection-aware conversation history reconciliation.
-
-The durable conversation is the source of truth. Client-provided history is a
-model-context projection and may legitimately normalize reasoning/content or
-compact/truncate older turns.
-
-The algorithm is deliberately conservative: exact/canonical matches are
-preferred; truncation requires a persisted suffix anchor; compaction requires
-both prefix/suffix anchors plus an explicit or strongly recognizable summary
-message. Unanchored rewrites remain conflicts.
-"""
+"""Projection-aware conversation history reconciliation."""
 
 from __future__ import annotations
 
@@ -18,7 +8,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ReconciliationResult:
-    """Result of reconciling an incoming client projection."""
+    """Result of reconciling a client history projection."""
 
     mode: str
     append_from: int | None = None
@@ -40,11 +30,11 @@ def _text_content(value: Any) -> str | None:
 
 
 def canonical_message(message: dict[str, Any]) -> dict[str, Any]:
-    """Return the representation used for semantic history comparison.
+    """Canonicalize only known representation-level differences.
 
-    Reasoning is intentionally excluded because provider/client pipelines may
-    normalize, omit, or reconstruct it. Text-only content scalar/parts forms
-    are normalized to one string. All other fields remain significant.
+    Reasoning is intentionally not part of conversation identity: providers and
+    clients may normalize, omit, or reconstruct it. Text scalar/content-parts
+    are canonicalized to the same text. Other fields remain significant.
     """
     result = dict(message)
     for key in ("reasoning_content", "reasoning", "reasoning_text"):
@@ -60,13 +50,7 @@ def equivalent(a: dict[str, Any], b: dict[str, Any]) -> bool:
 
 
 def _is_compaction_summary(message: dict[str, Any]) -> bool:
-    """Recognize explicit or OpenCode-compatible compaction summaries.
-
-    Explicit metadata is preferred. OpenCode's current compaction prompt emits
-    a stable Markdown structure beginning with Objective/Important Details and
-    containing Work State/Next Move/Relevant Files. This fallback is intentionally
-    strict so arbitrary assistant text cannot become a compaction escape hatch.
-    """
+    """Recognize explicit or OpenCode-compatible compaction summaries."""
     if message.get("summary") is True:
         return True
     if str(message.get("mode", "")).lower() == "compaction":
@@ -79,6 +63,9 @@ def _is_compaction_summary(message: dict[str, Any]) -> bool:
     text = _text_content(message.get("content"))
     if not text:
         return False
+    # OpenCode's current compaction summary template uses these five stable
+    # headings. Keep recognition strict so arbitrary assistant text cannot
+    # become a compaction escape hatch.
     required = (
         "## Objective",
         "## Important Details",
@@ -97,32 +84,61 @@ def _prefix_len(persisted: list[dict[str, Any]], incoming: list[dict[str, Any]])
     return index
 
 
-def _suffix_match(
-    persisted: list[dict[str, Any]], incoming: list[dict[str, Any]],
-) -> tuple[int, int] | None:
-    """Return (persisted_start, incoming_start) for the longest suffix anchor."""
-    max_len = min(len(persisted), len(incoming))
-    for length in range(max_len, 0, -1):
-        p_start = len(persisted) - length
-        i_start = len(incoming) - length
-        if all(equivalent(persisted[p], incoming[i]) for p, i in zip(
-            range(p_start, len(persisted)), range(i_start, len(incoming))
-        )):
-            return p_start, i_start
+def _suffix_match(persisted: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> tuple[int, int] | None:
+    """Return the longest suffix shared by both sequences in O(n)."""
+    p = len(persisted) - 1
+    i = len(incoming) - 1
+    while p >= 0 and i >= 0 and equivalent(persisted[p], incoming[i]):
+        p -= 1
+        i -= 1
+    if p == len(persisted) - 1:
+        return None
+    return p + 1, i + 1
+
+
+def _anchor_before_tail(
+    persisted: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    prefix: int,
+    *,
+    max_scan: int = 128,
+) -> tuple[int, int, int] | None:
+    """Find a persisted suffix anchor occurring before a new incoming tail.
+
+    Returns (persisted_start, incoming_start, incoming_end). The bounded scan
+    is only used after prefix mismatch, so the normal replay/append path stays
+    linear. A compaction summary is required by the caller before accepting the
+    anchor, preventing arbitrary rewrites from being treated as projections.
+    """
+    if prefix >= len(incoming) or prefix >= len(persisted):
+        return None
+    persisted_end = len(persisted)
+    lower = max(prefix + 1, len(incoming) - max_scan)
+    for incoming_end in range(len(incoming), lower - 1, -1):
+        p = persisted_end - 1
+        i = incoming_end - 1
+        if p < prefix or i < prefix:
+            continue
+        while p >= prefix and i >= prefix and equivalent(persisted[p], incoming[i]):
+            p -= 1
+            i -= 1
+        if i < incoming_end - 1:
+            return p + 1, i + 1, incoming_end
     return None
 
 
 def reconcile_projection(
     persisted: list[dict[str, Any]], incoming: list[dict[str, Any]]
 ) -> ReconciliationResult:
-    """Reconcile client projection without mutating persisted history.
+    """Reconcile a client projection without mutating persisted history.
 
     Modes:
       exact     - complete canonical replay;
-      append    - canonical persisted prefix followed by new messages;
+      append    - persisted history is a canonical prefix;
       truncate  - incoming is a persisted suffix;
-      compacted - prefix and suffix anchors survive a summarized gap, with the
-                  incoming gap containing an explicit/recognized summary;
+      compacted - a recognized summary replaces a persisted region and a
+                  persisted suffix remains anchored, optionally followed by new
+                  incoming messages;
       conflict  - no safe continuity proof exists.
     """
     if not incoming:
@@ -138,20 +154,17 @@ def reconcile_projection(
     if prefix == len(persisted):
         return ReconciliationResult("append", len(persisted))
 
-    # A compacted projection may replace an older persisted region while
-    # retaining a recent suffix. Require a real prefix anchor, a real suffix
-    # anchor, and a recognized summary in the replaced incoming region.
-    suffix = _suffix_match(persisted[prefix:], incoming[prefix:])
-    if suffix is not None:
-        persisted_start, incoming_start = suffix
-        persisted_start += prefix
-        incoming_start += prefix
-        if persisted_start > prefix and incoming_start > prefix:
-            gap = incoming[prefix:incoming_start]
-            if any(_is_compaction_summary(message) for message in gap):
-                return ReconciliationResult("compacted", len(incoming))
+    # First try a compacted projection. A prefix anchor plus a suffix anchor
+    # and an explicit/strongly recognizable summary are required.
+    anchor = _anchor_before_tail(persisted, incoming, prefix)
+    if anchor is not None:
+        persisted_start, incoming_start, incoming_end = anchor
+        gap = incoming[prefix:incoming_start]
+        if persisted_start > prefix and any(_is_compaction_summary(m) for m in gap):
+            return ReconciliationResult("compacted", incoming_end)
 
-    # A pure tail projection is safe even when there is no common prefix.
+    # A pure tail projection is safe when the incoming history ends at a
+    # persisted suffix. No summary is needed because no rewrite is implied.
     suffix = _suffix_match(persisted, incoming)
     if suffix is not None and suffix[0] > 0:
         return ReconciliationResult("truncate")
