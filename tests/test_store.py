@@ -124,3 +124,57 @@ def test_append_preserves_order_across_batches():
             await pool.close()
 
     asyncio.run(_run())
+
+
+def test_reconcile_accepts_opencode_projection_without_rewriting_raw_history():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            persisted = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world", "reasoning_content": "A"},
+            ]
+            await store.append_messages(conv, persisted)
+
+            incoming = [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "assistant", "content": "world", "reasoning_content": "B"},
+                {"role": "user", "content": "next"},
+            ]
+            await store.reconcile_history(conv, incoming)
+
+            rebuilt = await store.get_messages(conv)
+            assert rebuilt[:2] == persisted
+            assert rebuilt[2] == incoming[2]
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_reconcile_rejects_real_rewrite():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            persisted = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "original"},
+            ]
+            await store.append_messages(conv, persisted)
+
+            with pytest.raises(Exception, match="diverges from persisted history"):
+                await store.reconcile_history(
+                    conv,
+                    [
+                        persisted[0],
+                        {"role": "assistant", "content": "rewritten"},
+                    ],
+                )
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
