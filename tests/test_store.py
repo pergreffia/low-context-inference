@@ -41,7 +41,6 @@ def test_conversation_roundtrip_with_tool_parts():
     async def _run():
         pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
         try:
-            # FK-safe cleanup so the test is re-runnable on a dirty database.
             await pool.execute(
                 """
                 DELETE FROM tool_results WHERE message_id IN
@@ -166,7 +165,9 @@ def test_reconcile_rejects_real_rewrite():
             ]
             await store.append_messages(conv, persisted)
 
-            with pytest.raises(Exception, match="diverges from persisted history"):
+            from context_proxy.conversation.store import HistoryDivergenceError
+
+            with pytest.raises(HistoryDivergenceError, match="diverges from persisted history"):
                 await store.reconcile_history(
                     conv,
                     [
