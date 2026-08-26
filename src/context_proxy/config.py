@@ -22,10 +22,21 @@ class ServerSettings(BaseModel):
 
 
 class EndpointSettings(BaseModel):
+    """Endpoint configuration for inference providers.
+
+    The inference model is deliberately NOT configured here: the client owns
+    model selection and sends the `model` field on every inference request.
+    """
+
     base_url: str = "http://localhost:8000/v1"
     api_key: str = ""
-    model: str | None = None
     timeout_seconds: float = Field(default=600.0, gt=0)
+
+
+class ModelEndpointSettings(EndpointSettings):
+    """Endpoint configuration for a system-owned model (embeddings/compact)."""
+
+    model: str | None = None
 
 
 class DatabaseSettings(BaseModel):
@@ -210,12 +221,12 @@ class Settings(BaseSettings):
     resilience: ResilienceSettings = ResilienceSettings()
     rate_limit: RateLimitSettings = RateLimitSettings()
     security: SecuritySettings = SecuritySettings()
-    compact: EndpointSettings = EndpointSettings(
+    compact: ModelEndpointSettings = ModelEndpointSettings(
         base_url="http://localhost:8001/v1",
         api_key="local",
         model="compact-model",
     )
-    embeddings: EndpointSettings = EndpointSettings(
+    embeddings: ModelEndpointSettings = ModelEndpointSettings(
         base_url="http://localhost:8002/v1",
         api_key="local",
         model="embedding-model",
