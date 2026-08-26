@@ -16,8 +16,10 @@ def msg(role: str, content: Any, **extra: Any) -> dict[str, Any]:
 
 def summary() -> dict[str, Any]:
     return msg(
-        "assistant",
-        """## Objective
+        "user",
+        """The conversation history before this point was compacted into the following summary:
+<summary>
+## Objective
 - continue the task
 
 ## Important Details
@@ -36,6 +38,7 @@ def summary() -> dict[str, Any]:
 
 ## Relevant Files
 - src/example.py
+</summary>
 """,
     )
 
