@@ -39,6 +39,8 @@ def create_app(
     settings = settings or load_settings()
     database = database or Database(settings.database)
     owned_clients: list[httpx.AsyncClient] = []
+    # Ownership rule (§17): only clients the application creates are closed
+    # on shutdown. An injected llm_client belongs to the caller.
     owned_llm_client = llm_client is None
     breaker = CircuitBreaker(
         failure_threshold=settings.resilience.breaker_failure_threshold,
@@ -62,6 +64,7 @@ def create_app(
             await database.start()
             app.state.database = database
             if store is not None:
+                # Test/injected store wins over the database-backed one.
                 app.state.store = store
             elif database.available and database.pool is not None:
                 app.state.store = ProjectionAwareConversationStore(database.pool)
@@ -71,6 +74,8 @@ def create_app(
             if memory_service is not None:
                 app.state.memory = memory_service
             elif database.available and database.pool is not None:
+                # Ownership rule (M3 review §2): clients created here are closed on
+                # shutdown; injected/external clients are NEVER closed by the app.
                 embed_client = embedding_client
                 if embed_client is None:
                     embed_client = httpx.AsyncClient(
@@ -106,22 +111,29 @@ def create_app(
             started = True
             yield
         finally:
+            # Unconditional cleanup (§17 + final review §4): runs on graceful
+            # shutdown AND on any startup failure after resource creation.
+            # Each owned resource closes in isolation — one failure never
+            # blocks the others. Injected resources are never touched.
             if owned_llm_client and getattr(app.state, "llm", None) is not None:
                 try:
                     await app.state.llm.aclose()
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - isolation is the point
                     logger.warning("inference_client_close_failed", extra={"error": str(exc)})
             for client in owned_clients:
                 try:
                     await client.aclose()
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - isolation is the point
                     logger.warning("client_close_failed", extra={"error": str(exc)})
             try:
                 await database.close()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("database_close_failed", extra={"error": str(exc)})
-        _ = started
+        _ = started  # kept for readability of the startup/teardown split
 
+    # Interactive API documentation (final hardening pass): disabled entirely
+    # in production mode — the schema and app metadata must not be exposed on
+    # internet-facing deployments. Development keeps the defaults.
     docs_kwargs = (
         {}
         if settings.security.mode == "development"
@@ -131,8 +143,10 @@ def create_app(
         title="Context Proxy", version="0.1.0", lifespan=lifespan, **docs_kwargs
     )
     app.state.settings = settings
+    # Exposed for diagnostics/observability (bounded-memory contract).
     app.state.rate_limiter = rate_limiter
     if llm_client is None:
+        # Application-owned inference client: closed on shutdown (M6 review).
         llm_client = httpx.AsyncClient(
             base_url=settings.inference.base_url,
             timeout=httpx.Timeout(settings.inference.timeout_seconds),
@@ -145,7 +159,10 @@ def create_app(
         resilience=settings.resilience,
         breaker=breaker,
     )
+    # The engine owns no network resources: it is plain configuration plus
+    # pure selection logic, so it can be built eagerly (M4).
     if context_engine is not None:
+        # Test/injected engine wins over the configured one.
         app.state.context_engine = context_engine
     elif settings.assembly.enabled:
         app.state.context_engine = ContextAssemblyEngine(
@@ -158,6 +175,7 @@ def create_app(
     app.include_router(router)
     app.include_router(internal_router)
 
+    # M5 observability outermost: request-id, metrics, resource limits.
     app.add_middleware(
         ObservabilityMiddleware,
         max_body_bytes=settings.server.max_body_bytes,
@@ -167,6 +185,12 @@ def create_app(
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
+        """Last-resort handler: stable generic 500 body, no internal details.
+
+        Full diagnostics are already logged (with redaction) by the
+        observability middleware. TestClient(raise_server_exceptions=True)
+        bypasses this handler so tests can assert on real exception types.
+        """
         return JSONResponse(
             status_code=500,
             content={
@@ -190,12 +214,17 @@ def create_app(
 
     @app.get("/readyz")
     async def readyz():
+        """Readiness: process can accept traffic; dependency states reported.
+
+        PostgreSQL is optional by design (§31 degraded passthrough), so it
+        degrades readiness reporting rather than failing it.
+        """
         db_state = "degraded"
         if database.available:
             try:
                 await database.ping()
                 db_state = "ok"
-            except Exception:
+            except Exception:  # noqa: BLE001
                 db_state = "degraded"
         return {
             "ready": True,
@@ -208,7 +237,7 @@ def create_app(
         if database.available:
             try:
                 await database.ping()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 db_state = "degraded"
         return {"status": "ok", "database": db_state}
 
