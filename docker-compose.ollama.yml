@@ -1,0 +1,42 @@
+# Override per usare il proxy Compose con Ollama installato SUL HOST.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ollama.yml up --build
+#
+# Requisiti sul host:
+#   ollama pull MichelRosselli/bonsai-27b:latest
+#   ollama pull nomic-embed-text          # opzionale: embeddings per la memoria
+#
+# Nota macOS/Windows: host.docker.internal funziona nativamente.
+# Nota Linux: extra_hosts:host-gateway lo mappa sull'IP del host.
+# NON avviare Ollama dentro Docker su macOS: il container non vede la GPU
+# e girerebbe solo su CPU — usa il binario locale.
+
+services:
+  context-proxy:
+    environment:
+      # Inference: Ollama sul host (endpoint OpenAI-compatibile di Ollama)
+      INFERENCE__BASE_URL: http://host.docker.internal:11434/v1
+      INFERENCE__MODEL: MichelRosselli/bonsai-27b:latest
+      # Deve corrispondere al context window REALLY SERVITO da Ollama:
+      # se nel Modelfile/API usi un num_ctx diverso, allinea questo valore
+      # (o abbassa CONTEXT__MODEL_LIMIT_TOKENS), altrimenti Ollama tronca
+      # silenziosamente il prompt lato suo.
+      CONTEXT__MODEL_LIMIT_TOKENS: "32768"
+      CONTEXT__SAFETY_MARGIN_TOKENS: "2048"
+
+      # Embeddings per la memoria ibrida (stesso Ollama).
+      # Senza il modello scaricato il proxy degrada da solo a retrieval
+      # lessicale — nessun errore blocca le chat.
+      EMBEDDINGS__BASE_URL: http://host.docker.internal:11434/v1
+      EMBEDDINGS__MODEL: nomic-embed-text
+
+    # NOTA bonsai-27b (reasoning model): ogni risposta assistant include anche
+    # un campo "reasoning" oltre a "content". La reconciliation è posizionale
+    # ed esatta: quando rispedite la storia per continuare una conversazione,
+    # includete i messaggi assistant ESATTAMENTE come ricevuti (reasoning
+    # compreso), altrimenti otterrete 409 history_conflict.
+    #
+    # Porta PostgreSQL sull'host già occupata? Impostate POSTGRES_PORT=<altro>.
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
