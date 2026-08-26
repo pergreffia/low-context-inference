@@ -10,8 +10,8 @@ reads and writes history, so reconciliation is atomic per conversation across
 multiple proxy processes. Different conversations never block each other.
 
 Orphan tool-result policy: a tool result whose `tool_call_id` has no matching
-call in the same conversation keeps `tool_call_ref = NULL` — the raw message
-is preserved (source of truth), never attached to an unrelated call, and an
+call in the same conversation keeps `tool_call_ref = NULL` — the raw message is
+preserved (source of truth), never attached to an unrelated call, and an
 `orphan_tool_result` warning is logged with the conversation and call ids.
 """
 
@@ -23,6 +23,8 @@ import logging
 from typing import Any
 
 import asyncpg
+
+from context_proxy.conversation.reconciliation import reconcile_projection
 
 logger = logging.getLogger(__name__)
 
@@ -149,35 +151,41 @@ class PostgresConversationStore:
         messages: list[dict[str, Any]],
         metadata: dict[str, Any] | None = None,
     ) -> list[str]:
-        """Idempotently sync a full client history (M2.1 §1, M2.2 §1).
+        """Idempotently sync a full client history using projection semantics.
 
-        Full-history clients resend the entire conversation each turn: only the
-        new suffix is appended. Comparison is positional raw-content equality
-        (parsed JSON), never content-based deduplication — identical messages
-        may legitimately occur multiple times.
+        Full-history clients resend the entire conversation each turn. The
+        reconciliation policy accepts exact replays, known client projections
+        (including OpenCode reasoning/text normalization and compaction), safe
+        truncation, and a new suffix. Persisted raw history is never rewritten;
+        only a genuinely new incoming tail is appended.
 
         Atomic per conversation: lock -> read -> compare -> append -> commit in
         ONE transaction. A concurrent writer waits on the row lock, then re-reads
-        the committed history before comparing, so identical replays stay
-        idempotent and divergent histories can never silently merge.
+        the committed history before comparing.
         """
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await self._ensure_conversation(conn, conversation_id)
                 await self._lock_conversation(conn, conversation_id)
                 persisted = await self._fetch_messages(conn, conversation_id)
-                overlap = min(len(persisted), len(messages))
-                for index in range(overlap):
-                    if persisted[index] != messages[index]:
-                        raise HistoryDivergenceError(
-                            conversation_id,
-                            index,
-                            persisted=persisted[index],
-                            incoming=messages[index],
-                        )
-                suffix = messages[len(persisted):]
-                if not suffix:
+                result = reconcile_projection(persisted, messages)
+                if result.mode == "conflict":
+                    index = min(len(persisted), len(messages))
+                    for candidate in range(index):
+                        from context_proxy.conversation.reconciliation import equivalent
+
+                        if not equivalent(persisted[candidate], messages[candidate]):
+                            index = candidate
+                            break
+                    raise HistoryDivergenceError(
+                        conversation_id,
+                        index,
+                        persisted=persisted[index] if index < len(persisted) else None,
+                        incoming=messages[index] if index < len(messages) else None,
+                    )
+                if result.append_from is None or result.append_from >= len(messages):
                     return []
+                suffix = messages[result.append_from :]
                 return await self._insert_messages(conn, conversation_id, suffix, metadata)
 
     async def _fetch_messages(
@@ -277,11 +285,6 @@ class PostgresConversationStore:
                 json.dumps(extra, ensure_ascii=False),
             )
         if message.get("role") == "tool" and message.get("tool_call_id"):
-            # Association rule: newest matching call within the SAME
-            # conversation (created_at DESC, then id DESC as a total-order
-            # tie-break — identical timestamps must stay deterministic).
-            # Duplicate call ids resolve deterministically to the most recent
-            # call; results never cross conversations.
             tool_call_ref = await conn.fetchval(
                 """
                 SELECT tc.id FROM tool_calls tc
@@ -331,14 +334,12 @@ class PostgresConversationStore:
         messages.jsonb; this registry is a queryable index associated with the
         interaction unit. Insert is idempotent per (message, part_index).
         """
-        import hashlib
-
         content = message.get("content")
         if not isinstance(content, list):
             return
         for index, part in enumerate(content):
             if not isinstance(part, dict):
-                continue  # unknown parts stay opaque in raw storage only
+                continue
             kind = part.get("type")
             if kind != "image_url":
                 continue
