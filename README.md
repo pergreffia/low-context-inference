@@ -107,7 +107,7 @@ feature, not a substitute for a deployment without PostgreSQL.
 docker compose up --build
 ```
 
-This starts `context-proxy` (:8080), `postgres` (loopback-only :5432) and
+This starts `context-proxy` (host port :11435), `postgres` (loopback-only :5432) and
 `qdrant` (loopback-only :6333/6344). Migrations run automatically at proxy
 startup. Details: [docs/deployment.md](docs/deployment.md).
 
@@ -116,7 +116,7 @@ startup. Details: [docs/deployment.md](docs/deployment.md).
 Any OpenAI-compatible client works:
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:11435/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "m",

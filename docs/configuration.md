@@ -18,7 +18,11 @@ multimodal costs are code constants.
 | Variable | Type | Default | Effect |
 |---|---|---|---|
 | `SERVER__HOST` | str | `0.0.0.0` | uvicorn bind host (used via CLI/Compose) |
-| `SERVER__PORT` | int | `8080` | listen port |
+| `SERVER__PORT` | int | `8080` | listen port (process-level; source runs & container internal) |
+
+Compose-only: the PUBLISHED host port is `PROXY_PORT` (default `11435`) —
+it maps to the container's fixed internal 8080. `SERVER__PORT` inside the
+container stays 8080 regardless.
 | `SERVER__LOG_LEVEL` | str | `INFO` | log level |
 | `SERVER__LOG_JSON` | bool | `false` | JSON-lines logging when true |
 | `SERVER__MAX_BODY_BYTES` | int > 0 | `8388608` (8 MiB) | request-body cap; oversized → `413 request_too_large` |

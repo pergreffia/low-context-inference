@@ -17,7 +17,11 @@ services:
       # boundary, local development stays friction-free).
       SECURITY__INTERNAL_AUTH_TOKEN: ${SECURITY__INTERNAL_AUTH_TOKEN:-}
     ports:
-      - "${SERVER__PORT:-8080}:8080"
+      # Porta PUBBLICATA sull'host (default 11435, adiacente al range Ollama
+      # per evitare conflitti con le web-app che tipicamente occupano 8080).
+      # Il container ascolta SEMPRE internamente su 8080: non usare
+      # SERVER__PORT qui, cambierebbe anche la porta interna (CMD uvicorn).
+      - "${PROXY_PORT:-11435}:8080"
     depends_on:
       postgres:
         condition: service_healthy

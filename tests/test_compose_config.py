@@ -45,3 +45,17 @@ def test_proxy_depends_on_postgres_and_qdrant_health():
 def test_external_endpoints_documented_as_external():
     text = _compose_text()
     assert "EXTERNAL services" in text  # inference/embeddings policy comment
+
+
+def test_proxy_publishes_default_11435_to_fixed_internal_8080():
+    """Published host port defaults to 11435 (Ollama-adjacent, avoids the
+    usual 8080 web-app conflicts); container side stays fixed on 8080 —
+    SERVER__PORT must NOT drive the mapping (it would move uvicorn too)."""
+    text = _compose_text()
+    proxy_block = _service_block(text, "context-proxy", "postgres")
+    assert '"${PROXY_PORT:-11435}:8080"' in proxy_block
+    port_lines = [
+        ln.strip() for ln in proxy_block.splitlines()
+        if "8080" in ln and ln.strip().startswith("- \"")
+    ]
+    assert len(port_lines) == 1 and ":8080" in port_lines[0]

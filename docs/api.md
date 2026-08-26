@@ -1,6 +1,8 @@
 # API
 
-Base URL: `http://<host>:8080`. The proxy is OpenAI-compatible: clients are
+Base URL: `http://<host>:8080` when running from source (default),
+`http://<host>:11435` with the default Docker Compose setup (`PROXY_PORT`).
+The proxy is OpenAI-compatible: clients are
 standard SDKs/agents pointed at the proxy base URL. Request/response bodies
 are never rewritten (except documented error normalization).
 

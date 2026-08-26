@@ -37,7 +37,8 @@ token never appears in diagnostics output, logs, or metrics. Public
 
 Compose topology (see [deployment.md](deployment.md)):
 
-- `context-proxy` publishes `${SERVER__PORT:-8080}` on all interfaces
+- `context-proxy` publishes host port `${PROXY_PORT:-11435}` on all interfaces
+  (container listens internally on 8080)
   (intended to sit behind a reverse proxy/TLS terminator);
 - `postgres` publishes `127.0.0.1:5432` and `qdrant` `127.0.0.1:6333/6344`
   — **loopback only**; container-to-container traffic uses service names on

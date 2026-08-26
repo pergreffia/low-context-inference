@@ -18,7 +18,7 @@ Python 3.12+ only if running from source instead of the image.
 
 | Service | Image / build | Published ports | Internal name |
 |---|---|---|---|
-| `context-proxy` | built from `Dockerfile` | `${SERVER__PORT:-8080}:8080` | `context-proxy` |
+| `context-proxy` | built from `Dockerfile` | `${PROXY_PORT:-11435}:8080` (host → container) | `context-proxy` |
 | `postgres` | `postgres:16-alpine` | `127.0.0.1:${POSTGRES_PORT:-5432}:5432` (**loopback only**) | `postgres` |
 | `qdrant` | `qdrant/qdrant:v1.12.4` | `127.0.0.1:6333:6333`, `127.0.0.1:6344:6344` (**loopback only**) | `qdrant` |
 
@@ -51,8 +51,8 @@ instead — see [operations.md](operations.md#degraded-modes).
 Verify:
 
 ```bash
-curl -s http://localhost:8080/healthz     # {"status":"ok","database":"ok"}
-curl -s http://localhost:8080/metrics | head
+curl -s http://localhost:11435/healthz     # {"status":"ok","database":"ok"}
+curl -s http://localhost:11435/metrics | head
 ```
 
 ## Connecting a provider
@@ -92,7 +92,8 @@ response bodies are never rewritten.
 ## Production checklist
 
 - **Reverse proxy / TLS**: terminate TLS in front of the proxy (nginx,
-  Caddy, Traefik). The proxy itself speaks plain HTTP on :8080 and sets no
+  Caddy, Traefik). The proxy speaks plain HTTP internally on :8080 (published as
+  `${PROXY_PORT:-11435}`) and sets no
   TLS options.
 - **Internal endpoints**: put `/internal/*` behind your ingress deny-rule
   AND set:
@@ -108,6 +109,9 @@ response bodies are never rewritten.
   standard `pg_dump`/physical backups — it is the source of truth.
 - **Qdrant persistence**: keep `qdrant_storage`; loss is recoverable via
   `POST /internal/v1/index/rebuild` (rebuilds from PostgreSQL).
+- **Published port**: Compose publishes the API on host port
+  `PROXY_PORT` (default **11435**); the container itself always listens on
+  8080. Override with `PROXY_PORT=<port> docker compose … up -d`.
 - **Monitoring**: scrape `/metrics` (Prometheus text format); watch request
   counters/latency, breaker gauge, degradation/capture-overflow/rate-limit
   counters. `/metrics` has no application-level authentication — restrict it
