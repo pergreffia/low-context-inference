@@ -57,7 +57,10 @@ def _is_compaction_summary(message: dict[str, Any]) -> bool:
         return True
     metadata = message.get("metadata")
     if isinstance(metadata, dict):
-        if metadata.get("compaction") is True or metadata.get("compaction_continue") is True:
+        if (
+            metadata.get("compaction") is True
+            or metadata.get("compaction_continue") is True
+        ):
             return True
 
     text = _text_content(message.get("content"))
@@ -75,7 +78,9 @@ def _is_compaction_summary(message: dict[str, Any]) -> bool:
     )
 
 
-def _prefix_len(persisted: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> int:
+def _prefix_len(
+    persisted: list[dict[str, Any]], incoming: list[dict[str, Any]]
+) -> int:
     limit = min(len(persisted), len(incoming))
     index = 0
     while index < limit and equivalent(persisted[index], incoming[index]):
@@ -83,7 +88,9 @@ def _prefix_len(persisted: list[dict[str, Any]], incoming: list[dict[str, Any]])
     return index
 
 
-def _suffix_match(persisted: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> tuple[int, int] | None:
+def _suffix_match(
+    persisted: list[dict[str, Any]], incoming: list[dict[str, Any]]
+) -> tuple[int, int] | None:
     """Return the longest suffix shared by both sequences in O(n)."""
     p = len(persisted) - 1
     i = len(incoming) - 1
