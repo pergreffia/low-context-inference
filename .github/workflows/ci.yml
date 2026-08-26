@@ -6,7 +6,11 @@ name: CI
 #   BASE_MODEL=MichelRosselli/bonsai-27b:latest ./scripts/e2e_real_provider.sh
 on:
   push:
+    branches:
+      - main
   pull_request:
+    branches:
+      - main
 
 jobs:
   unit:
