@@ -27,7 +27,7 @@ class UpstreamUnavailable(ContextProxyError):
 
 
 def map_upstream_error(exc: httpx.HTTPError) -> ContextProxyError:
-    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+    if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout):
         return UpstreamUnavailable(f"cannot connect to upstream endpoint: {exc}")
     if isinstance(exc, httpx.TimeoutException):
         return UpstreamUnavailable(f"upstream request timed out: {exc}")
