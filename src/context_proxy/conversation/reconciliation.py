@@ -165,8 +165,13 @@ def reconcile_projection(
     if anchor is not None:
         persisted_start, incoming_start, incoming_end = anchor
         gap = incoming[prefix:incoming_start]
-        if persisted_start > prefix and any(_is_compaction_summary(m) for m in gap):
-            return ReconciliationResult("compacted", incoming_end)
+        if persisted_start > prefix:
+            if any(_is_compaction_summary(m) for m in gap):
+                return ReconciliationResult("compacted", incoming_end)
+            if incoming_start == 0:
+                if incoming_end == len(incoming):
+                    return ReconciliationResult("truncate")
+                return ReconciliationResult("truncate_append", incoming_end)
 
     # A pure tail projection is safe only when the incoming sequence itself is
     # exactly a persisted suffix. A rewritten prefix followed by a valid suffix
