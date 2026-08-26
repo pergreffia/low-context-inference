@@ -123,7 +123,9 @@ def test_inference_settings_have_no_model_configuration() -> None:
     assert settings.compact.model == "compact-model"
 
 
-def test_embedding_nested_env_override_preserves_other_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_embedding_nested_env_override_preserves_other_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("EMBEDDINGS__API_KEY", "test-secret")
 
     settings = Settings()
@@ -134,7 +136,9 @@ def test_embedding_nested_env_override_preserves_other_defaults(monkeypatch: pyt
     assert settings.embeddings.timeout_seconds == 600.0
 
 
-def test_compact_nested_env_override_preserves_other_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_compact_nested_env_override_preserves_other_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("COMPACT__API_KEY", "test-secret")
 
     settings = Settings()
