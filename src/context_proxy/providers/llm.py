@@ -36,10 +36,13 @@ class OpenAICompatibleLLMProvider:
     rewritten (master prompt §6, §30). Header forwarding follows the explicit
     policy in providers.headers.
 
+    The inference model is selected by the client request. LCI configures the
+    endpoint and credentials, but never overrides the request's `model` field.
+
     M5 resilience: transport failures before any response byte are retried a
     bounded number of times with full-jitter backoff, guarded by a circuit
     breaker that fails fast while the endpoint is down. Upstream HTTP error
-    RESPONSES are answers and are neither retried nor counted as breaker
+    responses are answers and are neither retried nor counted as breaker
     failures. Streaming: only the pre-stream send is protected.
     """
 
@@ -66,10 +69,6 @@ class OpenAICompatibleLLMProvider:
         )
         self._route_label = route_label
 
-    @property
-    def model(self) -> str | None:
-        return self._settings.model
-
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -80,14 +79,14 @@ class OpenAICompatibleLLMProvider:
 
     async def complete(self, payload: dict[str, Any]) -> tuple[int, dict[str, str], bytes]:
         request = self._client.build_request(
-            "POST", "/chat/completions", json=self._prepared(payload)
+            "POST", "/chat/completions", json=payload
         )
         response = await self._send(request)
         return self._pack(response)
 
     async def open_stream(self, payload: dict[str, Any]) -> LLMStream:
         request = self._client.build_request(
-            "POST", "/chat/completions", json=self._prepared(payload)
+            "POST", "/chat/completions", json=payload
         )
         response = await self._resilient_send(request, streaming=True)
         if response.status_code >= 400:
@@ -213,22 +212,10 @@ class OpenAICompatibleLLMProvider:
             # reservation inside record_success/record_failure).
             self._breaker.release_probe()
 
-    def _prepared(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Resolve the configured inference model without mutating the caller's payload.
-
-        Policy: INFERENCE__MODEL set -> override; unset -> client value preserved.
-        """
-        if not self._settings.model:
-            return payload
-        prepared = dict(payload)
-        prepared["model"] = self._settings.model
-        return prepared
-
     @staticmethod
     def _pack(response: httpx.Response) -> tuple[int, dict[str, str], bytes]:
         headers = filter_response_headers(response.headers, keep_content_encoding=False)
         return response.status_code, headers, response.content
-
 
 
 class UpstreamLLMStream(LLMStream):
