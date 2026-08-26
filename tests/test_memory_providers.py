@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from context_proxy.config import EndpointSettings, ModelEndpointSettings
+from context_proxy.config import ModelEndpointSettings
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
 from context_proxy.memory.errors import EmbeddingProviderError
 from context_proxy.memory.qdrant import QdrantVectorStore
