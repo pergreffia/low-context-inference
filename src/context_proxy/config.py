@@ -22,10 +22,17 @@ class ServerSettings(BaseModel):
 
 
 class EndpointSettings(BaseModel):
+    """Generic endpoint settings; inference model selection is client-owned."""
+
     base_url: str = "http://localhost:8000/v1"
     api_key: str = ""
-    model: str | None = None
     timeout_seconds: float = Field(default=600.0, gt=0)
+
+
+class ModelEndpointSettings(EndpointSettings):
+    """Endpoint settings for internally model-selected services."""
+
+    model: str
 
 
 class DatabaseSettings(BaseModel):
@@ -141,9 +148,9 @@ class SecuritySettings(BaseModel):
     """Deployment-boundary configuration (post-0876b10 review §2).
 
     `/internal/*` is administrative and must sit on a private network; the
-    URL prefix alone is not a security mechanism. When `internal_auth_token`
-    is non-empty, every /internal/* request must present it in the
-    X-Internal-Auth header.
+    URL prefix alone is not a security mechanism. When
+    `internal_auth_token` is non-empty, every /internal/* request must present
+    it in the X-Internal-Auth header.
 
     Fail-closed production policy (post-04592c0 review §1): with
     `mode="production"` an empty token is a CONFIGURATION error — the proxy
@@ -196,6 +203,11 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
         env_file=".env",
         extra="ignore",
+        # Preserve defaults of nested BaseModel fields when an environment
+        # variable overrides only one member of the nested model. Without this,
+        # e.g. EMBEDDINGS__API_KEY replaces the entire ModelEndpointSettings
+        # value and makes its required `model` field appear missing.
+        nested_model_default_partial_update=True,
     )
 
     server: ServerSettings = ServerSettings()
@@ -210,12 +222,12 @@ class Settings(BaseSettings):
     resilience: ResilienceSettings = ResilienceSettings()
     rate_limit: RateLimitSettings = RateLimitSettings()
     security: SecuritySettings = SecuritySettings()
-    compact: EndpointSettings = EndpointSettings(
+    compact: ModelEndpointSettings = ModelEndpointSettings(
         base_url="http://localhost:8001/v1",
         api_key="local",
         model="compact-model",
     )
-    embeddings: EndpointSettings = EndpointSettings(
+    embeddings: ModelEndpointSettings = ModelEndpointSettings(
         base_url="http://localhost:8002/v1",
         api_key="local",
         model="embedding-model",

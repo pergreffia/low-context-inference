@@ -10,14 +10,14 @@ from collections.abc import Sequence
 
 import httpx
 
-from context_proxy.config import EndpointSettings
+from context_proxy.config import ModelEndpointSettings
 from context_proxy.memory.errors import EmbeddingProviderError
 
 logger = logging.getLogger(__name__)
 
 
 class OpenAICompatibleEmbeddingProvider:
-    def __init__(self, settings: EndpointSettings, client: httpx.AsyncClient | None = None):
+    def __init__(self, settings: ModelEndpointSettings, client: httpx.AsyncClient | None = None):
         self._settings = settings
         self._client = client or httpx.AsyncClient(
             base_url=settings.base_url,
@@ -34,9 +34,7 @@ class OpenAICompatibleEmbeddingProvider:
         failures (transport/timeout/HTTP status/malformed payload) so callers
         can degrade deliberately. Programming errors propagate untouched.
         """
-        payload: dict = {"input": list(texts)}
-        if self._settings.model:
-            payload["model"] = self._settings.model
+        payload: dict = {"input": list(texts), "model": self._settings.model}
         try:
             response = await self._client.post("/embeddings", json=payload)
             response.raise_for_status()

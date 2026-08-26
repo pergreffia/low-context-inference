@@ -12,29 +12,24 @@ in PostgreSQL.
 Local/self-hosted models have small context windows and coding agents keep
 growing conversations. Naive truncation loses instructions, decisions and
 file context. Low Context Inference persists every message verbatim, then assembles a
-**fresh, budget-fitting provider request for each turn** from the raw history plus
-derived memory — instead of forwarding ever-growing payloads or blindly
-truncating them.
+**fresh, budget-fitting provider request for each turn** from the raw history plus derived memory — instead of forwarding ever-growing payloads or blindly truncating them.
 
 ## What makes it different from a plain proxy
 
-- **Raw conversation is the source of truth** — stored verbatim in PostgreSQL,
-  positionally reconciled, never rewritten; divergent client histories are
-  rejected (`409`) instead of silently merged.
+- **Raw conversation is the source of truth** — stored verbatim in PostgreSQL;
+  client-side compaction/pruning is treated as a projection and reconciled
+  against durable history, while genuine forks/divergence are rejected (`409`).
 - **Context Assembly Engine** — per turn it selects what reaches the model:
   system/developer instructions and the current request are mandatory;
   ordinary history is dropped oldest-first as an atomic window; retrieved
   memories/chunks are packed last under an explicit token budget
   (`model_limit − safety_margin`).
-- **First-class `developer` role** — persisted verbatim, protected like
-  `system`, never normalized away.
+- **First-class `developer` role** — persisted verbatim, protected like `system`, never normalized away.
 - **Hybrid memory** — completed turns are chunked and embedded into Qdrant;
   typed memory records (decision/constraint/fact/task/bug/...) support
   supersession; retrieval fuses semantic + lexical + recency + importance +
   type signals, scoped strictly to one conversation.
-- **Multimodal transparency** — `content` part arrays (`text`, `image_url`)
-  pass through persistence → context selection → provider untouched; images
-  are flat-costed in the budget and excluded from retrieval queries.
+- **Multimodal transparency** — `content` part arrays (`text`, `image_url`) pass through persistence → context selection → provider untouched; images are flat-costed in the budget and excluded from retrieval queries.
 - **Tool transparency** — `function` and `custom` tool calls are validated,
   captured from streamed deltas, persisted (raw + relational projection) and
   replayed byte-exactly.
@@ -126,7 +121,8 @@ curl http://localhost:11435/v1/chat/completions \
 ```
 
 Repeat with the same `conversation_id` and the full history builds up server-side —
-clients may send just the new user message each turn.
+clients may send just the new user message each turn. The `model` field is always
+owned by the client; LCI forwards it to the configured inference endpoint.
 
 ### Configure an upstream provider
 
@@ -135,7 +131,7 @@ The proxy forwards to whatever OpenAI-compatible endpoint you configure:
 ```bash
 # Ollama example
 INFERENCE__BASE_URL=http://localhost:11434/v1
-INFERENCE__MODEL=MichelRosselli/bonsai-27b:latest   # optional: overrides client model
+# No INFERENCE__MODEL: the client selects the model in each request.
 CONTEXT__MODEL_LIMIT_TOKENS=32768                   # must match the model's real window
 ```
 
@@ -155,13 +151,12 @@ See [docs/development.md](docs/development.md) and
 
 ## Status
 
-The implemented system covers conversation management, context assembly,
-hybrid memory, multimodal transparency, tool-call lifecycle, operational
-hardening and security boundaries, verified by a deterministic test suite
-(~630 tests incl. PostgreSQL integration). Not implemented: distributed
-rate limiting/metrics backends, OTel tracing export, automatic memory
-extraction, compaction/summarization candidates, vision-derived
-descriptions of images.
+The implemented system covers conversation management, projection-aware history
+reconciliation, context assembly, hybrid memory, multimodal transparency,
+tool-call lifecycle, operational hardening and security boundaries, verified
+by a deterministic test suite plus PostgreSQL integration. Real-provider E2E
+remains a pre-release/manual validation step and is intentionally not part of
+standard CI.
 
 ## Documentation map
 

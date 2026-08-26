@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from context_proxy.config import EndpointSettings
+from context_proxy.config import ModelEndpointSettings
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
 from context_proxy.memory.errors import EmbeddingProviderError
 from context_proxy.memory.qdrant import QdrantVectorStore
@@ -30,7 +30,7 @@ def embedder():
         )
 
     provider = OpenAICompatibleEmbeddingProvider(
-        EndpointSettings(base_url="http://embed.test/v1", model="emb-1"),
+        ModelEndpointSettings(base_url="http://embed.test/v1", model="emb-1"),
         client=httpx.AsyncClient(
             base_url="http://embed.test/v1", transport=httpx.MockTransport(handler)
         ),
@@ -53,7 +53,7 @@ async def test_embed_error_propagates_for_degradation_handling():
         return httpx.Response(503, json={"error": "overloaded"})
 
     provider = OpenAICompatibleEmbeddingProvider(
-        EndpointSettings(base_url="http://embed.test/v1"),
+        ModelEndpointSettings(base_url="http://embed.test/v1", model="emb-1"),
         client=httpx.AsyncClient(
             base_url="http://embed.test/v1",
             transport=httpx.MockTransport(handler),

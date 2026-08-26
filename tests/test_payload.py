@@ -5,38 +5,43 @@ from conftest import CHAT_RESPONSE, client_for_handler
 from helpers import captured_json, chat_payload
 
 
-def test_model_override_applied_when_configured():
+class _TestAsyncStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b"data: x\n\n"
+
+
+def test_server_model_configuration_is_ignored():
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
         return httpx.Response(200, json=CHAT_RESPONSE)
 
-    client = client_for_handler(handler, model="qwen-model")
-
+    client = client_for_handler(handler, model="server-model")
     payload = chat_payload()  # model: "client-model"
     r = client.post("/v1/chat/completions", json=payload)
 
     assert r.status_code == 200
-    assert captured_json(captured[0])["model"] == "qwen-model"
-    # caller's dict untouched
+    assert captured_json(captured[0])["model"] == "client-model"
     assert payload["model"] == "client-model"
 
 
-def test_model_override_applied_to_streaming():
+def test_server_model_configuration_is_ignored_for_streaming():
     captured: list[httpx.Request] = []
-
-    async def agen():
-        yield b"data: x\n\n"
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
-        return httpx.Response(200, content=agen(), headers={"content-type": "text/event-stream"})
+        return httpx.Response(
+            200,
+            stream=_TestAsyncStream(),
+            headers={"content-type": "text/event-stream"},
+        )
 
-    client = client_for_handler(handler, model="qwen-model")
-    r = client.post("/v1/chat/completions", json=chat_payload(stream=True))
+    client = client_for_handler(handler, model="server-model")
+    payload = chat_payload(stream=True)
+    r = client.post("/v1/chat/completions", json=payload)
     assert r.status_code == 200
-    assert captured_json(captured[0])["model"] == "qwen-model"
+    assert captured_json(captured[0])["model"] == "client-model"
 
 
 def test_client_model_preserved_when_no_override_configured():
@@ -46,7 +51,7 @@ def test_client_model_preserved_when_no_override_configured():
         captured.append(request)
         return httpx.Response(200, json=CHAT_RESPONSE)
 
-    client = client_for_handler(handler)  # INFERENCE__MODEL unset
+    client = client_for_handler(handler)
     payload = chat_payload(model=None)
     payload["model"] = "client-model"
 
@@ -58,20 +63,21 @@ def test_client_model_preserved_when_no_override_configured():
 def test_original_payload_not_mutated_on_streaming_path():
     captured: list[httpx.Request] = []
 
-    async def agen():
-        yield b"data: x\n\n"
-
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
-        return httpx.Response(200, content=agen(), headers={"content-type": "text/event-stream"})
+        return httpx.Response(
+            200,
+            stream=_TestAsyncStream(),
+            headers={"content-type": "text/event-stream"},
+        )
 
-    client = client_for_handler(handler, model="override-model")
+    client = client_for_handler(handler, model="ignored-server-model")
     payload = chat_payload(stream=True)
 
     client.post("/v1/chat/completions", json=payload)
 
     assert payload["model"] == "client-model"
-    assert captured_json(captured[0])["model"] == "override-model"
+    assert captured_json(captured[0])["model"] == "client-model"
 
 
 def test_arbitrary_openai_fields_forwarded():
