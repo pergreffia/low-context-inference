@@ -23,7 +23,6 @@ def test_server_model_configuration_is_ignored():
 
     assert r.status_code == 200
     assert captured_json(captured[0])["model"] == "client-model"
-    # caller's dict untouched
     assert payload["model"] == "client-model"
 
 
@@ -34,7 +33,7 @@ def test_server_model_configuration_is_ignored_for_streaming():
         captured.append(request)
         return httpx.Response(
             200,
-            content=_TestAsyncStream(),
+            stream=_TestAsyncStream(),
             headers={"content-type": "text/event-stream"},
         )
 
@@ -52,7 +51,7 @@ def test_client_model_preserved_when_no_override_configured():
         captured.append(request)
         return httpx.Response(200, json=CHAT_RESPONSE)
 
-    client = client_for_handler(handler)  # INFERENCE__MODEL unset
+    client = client_for_handler(handler)
     payload = chat_payload(model=None)
     payload["model"] = "client-model"
 
@@ -68,7 +67,7 @@ def test_original_payload_not_mutated_on_streaming_path():
         captured.append(request)
         return httpx.Response(
             200,
-            content=_TestAsyncStream(),
+            stream=_TestAsyncStream(),
             headers={"content-type": "text/event-stream"},
         )
 
