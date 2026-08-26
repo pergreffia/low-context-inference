@@ -11,6 +11,11 @@ from context_proxy.config import EndpointSettings, Settings
 from context_proxy.providers.llm import OpenAICompatibleLLMProvider
 
 
+class _TestAsyncStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b"data: [DONE]\n\n"
+
+
 @pytest.mark.asyncio
 async def test_complete_forwards_client_model_without_server_override() -> None:
     seen: list[dict] = []
@@ -54,7 +59,7 @@ async def test_stream_forwards_client_model_without_server_override() -> None:
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            content=b"data: [DONE]\n\n",
+            stream=_TestAsyncStream(),
         )
 
     client = httpx.AsyncClient(
