@@ -5,11 +5,14 @@ from __future__ import annotations
 from typing import Any
 
 from context_proxy.conversation.reconciliation import reconcile_projection
-from context_proxy.conversation.store import HistoryDivergenceError, PostgresConversationStore
+from context_proxy.conversation.store import (
+    HistoryDivergenceError,
+    PostgresConversationStore,
+)
 
 
 class ProjectionAwareConversationStore(PostgresConversationStore):
-    """Use the durable transcript as source of truth while accepting client projections."""
+    """Use the durable transcript as source of truth while accepting projections."""
 
     async def reconcile_history(
         self,
@@ -26,8 +29,12 @@ class ProjectionAwareConversationStore(PostgresConversationStore):
 
                 if result.mode == "conflict":
                     index = min(len(persisted), len(messages))
-                    persisted_message = persisted[index] if index < len(persisted) else None
-                    incoming_message = messages[index] if index < len(messages) else None
+                    persisted_message = (
+                        persisted[index] if index < len(persisted) else None
+                    )
+                    incoming_message = (
+                        messages[index] if index < len(messages) else None
+                    )
                     raise HistoryDivergenceError(
                         conversation_id,
                         index,
