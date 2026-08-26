@@ -72,7 +72,8 @@ async def test_stream_forwards_client_model_without_server_override() -> None:
                 "stream": True,
             }
         )
-        assert b"".join([chunk async for chunk in stream.iter_bytes()]) == b"data: [DONE]\n\n"
+        chunks = [chunk async for chunk in stream.iter_bytes()]
+        assert b"".join(chunks) == b"data: [DONE]\n\n"
     finally:
         await provider.aclose()
 
