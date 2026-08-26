@@ -41,8 +41,14 @@ def summary() -> dict[str, Any]:
 
 
 def test_reasoning_difference_is_projection_equivalent():
-    persisted = [msg("user", "hello"), msg("assistant", "world", reasoning_content="A")]
-    incoming = [msg("user", "hello"), msg("assistant", "world", reasoning_content="B")]
+    persisted = [
+        msg("user", "hello"),
+        msg("assistant", "world", reasoning_content="A"),
+    ]
+    incoming = [
+        msg("user", "hello"),
+        msg("assistant", "world", reasoning_content="B"),
+    ]
 
     result = reconcile_projection(persisted, incoming)
 
@@ -84,8 +90,18 @@ def test_compaction_accepts_summary_and_preserved_tail():
 
 
 def test_compaction_without_new_tail_does_not_append_summary_or_tail():
-    persisted = [msg("user", "A"), msg("assistant", "A1"), msg("user", "B"), msg("assistant", "B1")]
-    incoming = [msg("user", "A"), summary(), msg("user", "B"), msg("assistant", "B1")]
+    persisted = [
+        msg("user", "A"),
+        msg("assistant", "A1"),
+        msg("user", "B"),
+        msg("assistant", "B1"),
+    ]
+    incoming = [
+        msg("user", "A"),
+        summary(),
+        msg("user", "B"),
+        msg("assistant", "B1"),
+    ]
 
     result = reconcile_projection(persisted, incoming)
 
@@ -94,7 +110,12 @@ def test_compaction_without_new_tail_does_not_append_summary_or_tail():
 
 
 def test_truncated_suffix_is_accepted():
-    persisted = [msg("user", "A"), msg("assistant", "A1"), msg("user", "B"), msg("assistant", "B1")]
+    persisted = [
+        msg("user", "A"),
+        msg("assistant", "A1"),
+        msg("user", "B"),
+        msg("assistant", "B1"),
+    ]
     incoming = [msg("user", "B"), msg("assistant", "B1")]
 
     result = reconcile_projection(persisted, incoming)
@@ -104,8 +125,18 @@ def test_truncated_suffix_is_accepted():
 
 
 def test_unanchored_rewrite_is_rejected():
-    persisted = [msg("user", "A"), msg("assistant", "A1"), msg("user", "B"), msg("assistant", "B1")]
-    incoming = [msg("user", "A"), msg("assistant", "different"), msg("user", "B"), msg("assistant", "B1")]
+    persisted = [
+        msg("user", "A"),
+        msg("assistant", "A1"),
+        msg("user", "B"),
+        msg("assistant", "B1"),
+    ]
+    incoming = [
+        msg("user", "A"),
+        msg("assistant", "different"),
+        msg("user", "B"),
+        msg("assistant", "B1"),
+    ]
 
     result = reconcile_projection(persisted, incoming)
 
@@ -118,7 +149,13 @@ def test_unknown_tool_result_cannot_be_accepted_as_projection():
         msg(
             "assistant",
             None,
-            tool_calls=[{"id": "call-1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{}"},
+                }
+            ],
         ),
         msg("tool", "ok", tool_call_id="call-1"),
     ]
@@ -127,7 +164,13 @@ def test_unknown_tool_result_cannot_be_accepted_as_projection():
         msg(
             "assistant",
             None,
-            tool_calls=[{"id": "call-1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{}"},
+                }
+            ],
         ),
         msg("tool", "bad", tool_call_id="unknown"),
     ]
@@ -144,7 +187,12 @@ class ProjectionFakeStore:
     async def ensure_conversation(self, conversation_id: str) -> None:
         self.conversations.setdefault(conversation_id, [])
 
-    async def reconcile_history(self, conversation_id: str, messages: list[dict[str, Any]], metadata=None):
+    async def reconcile_history(
+        self,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+        metadata=None,
+    ):
         persisted = self.conversations.setdefault(conversation_id, [])
         result = reconcile_projection(persisted, messages)
         if result.mode == "conflict":
@@ -159,7 +207,10 @@ class ProjectionFakeStore:
             return []
         suffix = messages[result.append_from :]
         persisted.extend(suffix)
-        return [f"msg-{len(persisted) - len(suffix) + i + 1}" for i in range(len(suffix))]
+        return [
+            f"msg-{len(persisted) - len(suffix) + i + 1}"
+            for i in range(len(suffix))
+        ]
 
     async def get_messages(self, conversation_id: str) -> list[dict[str, Any]]:
         return list(self.conversations.get(conversation_id, []))
@@ -175,7 +226,12 @@ def test_route_accepts_compacted_opencode_projection_and_persists_only_new_tail(
     conversation_id = "77777777-7777-7777-7777-777777777777"
 
     with client:
-        first = [msg("user", "A"), msg("assistant", "A1"), msg("user", "B"), msg("assistant", "B1")]
+        first = [
+            msg("user", "A"),
+            msg("assistant", "A1"),
+            msg("user", "B"),
+            msg("assistant", "B1"),
+        ]
         store.conversations[conversation_id] = first.copy()
         projected = [
             msg("user", "A"),
@@ -186,12 +242,14 @@ def test_route_accepts_compacted_opencode_projection_and_persists_only_new_tail(
         ]
         response = client.post(
             "/v1/chat/completions",
-            json={"model": "m", "messages": projected, "conversation_id": conversation_id},
+            json={
+                "model": "m",
+                "messages": projected,
+                "conversation_id": conversation_id,
+            },
         )
 
     assert response.status_code == 200
-    # The summary never replaces persisted history; only the new user turn and
-    # the normal assistant response are appended.
     assert store.conversations[conversation_id][:4] == first
     assert store.conversations[conversation_id][4]["content"] == "new"
     assert store.conversations[conversation_id][5]["role"] == "assistant"
@@ -205,5 +263,9 @@ def test_route_accepts_compacted_opencode_projection_and_persists_only_new_tail(
     ],
 )
 def test_real_rewrite_still_conflicts(incoming):
-    persisted = [msg("user", "A"), msg("assistant", "A1"), msg("user", "B")]
+    persisted = [
+        msg("user", "A"),
+        msg("assistant", "A1"),
+        msg("user", "B"),
+    ]
     assert reconcile_projection(persisted, incoming).mode == "conflict"
