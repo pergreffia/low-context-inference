@@ -11,7 +11,7 @@ from context_proxy.api.routes import router
 from context_proxy.api.routes_internal import router as internal_router
 from context_proxy.config import Settings, load_settings
 from context_proxy.context.engine import ContextAssemblyEngine
-from context_proxy.conversation.store import PostgresConversationStore
+from context_proxy.conversation.projection_store import ProjectionAwareConversationStore
 from context_proxy.db.database import Database
 from context_proxy.memory.embeddings import OpenAICompatibleEmbeddingProvider
 from context_proxy.memory.qdrant import QdrantVectorStore
@@ -67,7 +67,7 @@ def create_app(
                 # Test/injected store wins over the database-backed one.
                 app.state.store = store
             elif database.available and database.pool is not None:
-                app.state.store = PostgresConversationStore(database.pool)
+                app.state.store = ProjectionAwareConversationStore(database.pool)
             else:
                 app.state.store = None
 

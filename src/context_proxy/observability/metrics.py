@@ -319,9 +319,9 @@ def record_tokens(usage: dict | None, model: str | None = None) -> None:
     try:
         prompt = usage.get("prompt_tokens")
         completion = usage.get("completion_tokens")
-        if isinstance(prompt, (int, float)):
+        if isinstance(prompt, int | float):
             LLM_TOKENS_TOTAL.labels(direction="prompt").inc(prompt)
-        if isinstance(completion, (int, float)):
+        if isinstance(completion, int | float):
             LLM_TOKENS_TOTAL.labels(direction="completion").inc(completion)
     except Exception:  # noqa: BLE001 - accounting must never break requests
         pass

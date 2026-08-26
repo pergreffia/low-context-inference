@@ -59,7 +59,7 @@ def redact(value: Any) -> Any:
             key: (_REDACTED if _is_sensitive_key(key) else redact(item))
             for key, item in value.items()
         }
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, list | tuple | set):
         converted = [redact(item) for item in value]
         return type(value)(converted) if isinstance(value, tuple) else converted
     return value
