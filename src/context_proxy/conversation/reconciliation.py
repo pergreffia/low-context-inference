@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from typing import Any
 
-
 PRUNED_TOOL_RESULT = "[Old tool result content cleared]"
 
 
