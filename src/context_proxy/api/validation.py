@@ -155,7 +155,7 @@ def _validate_message(message: Any, index: int) -> None:
 
     if "content" in message:
         content = message["content"]
-        if content is not None and not isinstance(content, (str, list)):
+        if content is not None and not isinstance(content, str | list):
             raise _reject(f"{where}.content must be a string, array, or null")
         if isinstance(content, list):
             for part_index, part in enumerate(content):
