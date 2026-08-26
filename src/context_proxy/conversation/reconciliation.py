@@ -63,9 +63,6 @@ def _is_compaction_summary(message: dict[str, Any]) -> bool:
     text = _text_content(message.get("content"))
     if not text:
         return False
-    # OpenCode's current compaction summary template uses these five stable
-    # headings. Keep recognition strict so arbitrary assistant text cannot
-    # become a compaction escape hatch.
     required = (
         "## Objective",
         "## Important Details",
@@ -130,17 +127,7 @@ def _anchor_before_tail(
 def reconcile_projection(
     persisted: list[dict[str, Any]], incoming: list[dict[str, Any]]
 ) -> ReconciliationResult:
-    """Reconcile a client projection without mutating persisted history.
-
-    Modes:
-      exact     - complete canonical replay;
-      append    - persisted history is a canonical prefix;
-      truncate  - incoming is a persisted suffix;
-      compacted - a recognized summary replaces a persisted region and a
-                  persisted suffix remains anchored, optionally followed by new
-                  incoming messages;
-      conflict  - no safe continuity proof exists.
-    """
+    """Reconcile a client projection without mutating persisted history."""
     if not incoming:
         return ReconciliationResult("exact")
     if not persisted:
@@ -154,8 +141,6 @@ def reconcile_projection(
     if prefix == len(persisted):
         return ReconciliationResult("append", len(persisted))
 
-    # First try a compacted projection. A prefix anchor plus a suffix anchor
-    # and an explicit/strongly recognizable summary are required.
     anchor = _anchor_before_tail(persisted, incoming, prefix)
     if anchor is not None:
         persisted_start, incoming_start, incoming_end = anchor
@@ -163,10 +148,11 @@ def reconcile_projection(
         if persisted_start > prefix and any(_is_compaction_summary(m) for m in gap):
             return ReconciliationResult("compacted", incoming_end)
 
-    # A pure tail projection is safe when the incoming history ends at a
-    # persisted suffix. No summary is needed because no rewrite is implied.
+    # A pure tail projection is safe only when the incoming sequence itself is
+    # exactly a persisted suffix. A rewritten prefix followed by a valid suffix
+    # is a fork and must remain a conflict.
     suffix = _suffix_match(persisted, incoming)
-    if suffix is not None and suffix[0] > 0:
+    if suffix is not None and suffix[1] == 0 and suffix[0] > 0:
         return ReconciliationResult("truncate")
 
     return ReconciliationResult("conflict")
