@@ -131,7 +131,17 @@ def create_app(
                 logger.warning("database_close_failed", extra={"error": str(exc)})
         _ = started  # kept for readability of the startup/teardown split
 
-    app = FastAPI(title="Context Proxy", version="0.1.0", lifespan=lifespan)
+    # Interactive API documentation (final hardening pass): disabled entirely
+    # in production mode — the schema and app metadata must not be exposed on
+    # internet-facing deployments. Development keeps the defaults.
+    docs_kwargs = (
+        {}
+        if settings.security.mode == "development"
+        else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    )
+    app = FastAPI(
+        title="Context Proxy", version="0.1.0", lifespan=lifespan, **docs_kwargs
+    )
     app.state.settings = settings
     # Exposed for diagnostics/observability (bounded-memory contract).
     app.state.rate_limiter = rate_limiter

@@ -116,7 +116,8 @@ def test_upstream_error_body_passed_through(captured_requests):
         ),
     )
     with TestClient(app) as client:
-        response = client.post("/v1/chat/completions", json={"messages": []})
+        payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        response = client.post("/v1/chat/completions", json=payload)
 
     assert response.status_code == 401
     assert response.json() == {"error": {"message": "bad key", "type": "auth"}}
@@ -145,7 +146,8 @@ def test_upstream_unavailable_returns_openai_error():
         ),
     )
     with TestClient(app, raise_server_exceptions=False) as client:
-        response = client.post("/v1/chat/completions", json={"messages": []})
+        payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        response = client.post("/v1/chat/completions", json=payload)
         models_response = client.get("/v1/models")
 
     for r in (response, models_response):

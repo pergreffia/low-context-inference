@@ -22,6 +22,7 @@ SSE passthrough stays opaque (master prompt §8).
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from contextvars import ContextVar
@@ -52,6 +53,20 @@ ROUTE_ALIASES = (
 # Never throttled: liveness/readiness/telemetry must stay answerable even
 # while an abusive client is being shed.
 _RATE_LIMIT_EXEMPT_ROUTES = frozenset({"/healthz", "/readyz", "/metrics"})
+
+# X-Request-ID policy (final hardening pass): client-controlled value, echoed
+# into response headers and every log line. Accept only printable ASCII
+# (visible characters, no space) up to 128 chars; anything else — oversized,
+# control characters, CR/LF — falls back to a server-generated id instead of
+# failing an otherwise valid request or amplifying logs.
+_REQUEST_ID_MAX_CHARS = 128
+_SAFE_REQUEST_ID = re.compile(r"^[\x21-\x7E]{1,128}$")
+
+
+def _sanitize_request_id(raw: str | None) -> str | None:
+    if raw and _SAFE_REQUEST_ID.match(raw):
+        return raw
+    return None
 
 
 def current_request_id() -> str:
@@ -117,7 +132,10 @@ class ObservabilityMiddleware:
             return
 
         started = time.monotonic()
-        request_id = _header(scope, "x-request-id") or uuid.uuid4().hex[:16]
+        request_id = (
+            _sanitize_request_id(_header(scope, "x-request-id"))
+            or uuid.uuid4().hex[:16]
+        )
         token = REQUEST_ID_CTX.set(request_id)
         state = scope.setdefault("state", {})
         state.setdefault("stages", {})

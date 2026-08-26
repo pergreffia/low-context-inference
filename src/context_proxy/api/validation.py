@@ -32,10 +32,12 @@ def validate_chat_payload(payload: dict[str, Any]) -> None:
         raise _reject("request body must be a JSON object")
 
     messages = payload.get("messages")
-    if messages is None:
+    if not isinstance(messages, list) or isinstance(messages, bool):
         raise _reject("'messages' must be an array of message objects")
-    if not isinstance(messages, list):
-        raise _reject("'messages' must be an array of message objects")
+    if not messages:
+        # OpenAI-compatible contract requires at least one message; an
+        # empty array would only produce provider-specific errors.
+        raise _reject("'messages' must not be empty")
     for index, message in enumerate(messages):
         _validate_message(message, index)
 

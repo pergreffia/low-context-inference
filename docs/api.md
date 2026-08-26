@@ -32,7 +32,7 @@ Supported fields and semantics:
 | Field | Supported | Notes |
 |---|---|---|
 | `model` | yes | forwarded unchanged; overridden by `INFERENCE__MODEL` when configured |
-| `messages` | yes, required | array of message objects; roles below |
+| `messages` | yes, required, non-empty | array of message objects; roles below; empty array → `400 invalid_request_body` |
 | `stream` | yes (bool) | SSE when true |
 | `tools` / `tool_choice` | yes | passed through after structural validation |
 | `conversation_id` | yes | valid UUID; stripped before forwarding upstream; echoed back via `X-Conversation-ID` |

@@ -83,6 +83,12 @@ class RateLimiter:
         self._tokens: dict[str, float] = defaultdict(lambda: self._burst)
         self._updated: dict[str, float] = {}
         self._lock = Lock()
+        # Amortized TTL sweep (final hardening pass): a full-table scan under
+        # the global lock on EVERY admission is O(max_identities) per request.
+        # Sweep at most once per half-TTL window instead — expiry semantics
+        # shift by at most that window, the hard capacity bound is unaffected.
+        self._last_sweep = self._clock()
+        self._sweep_interval = self._ttl / 2.0
 
     # ------------------------------------------------------------ internals
 
@@ -115,7 +121,9 @@ class RateLimiter:
 
     def _consume(self, namespaced_key: str, now: float) -> bool:
         # Caller must hold the lock.
-        self._expire_stale(now)
+        if now - self._last_sweep >= self._sweep_interval:
+            self._expire_stale(now)
+            self._last_sweep = now
         if namespaced_key not in self._updated:
             self._make_room(namespaced_key, now)
         last = self._updated.get(namespaced_key)

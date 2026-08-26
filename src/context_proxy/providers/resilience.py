@@ -114,6 +114,19 @@ class CircuitBreaker:
             ):
                 self._transition(OPEN)
 
+    def release_probe(self) -> None:
+        """Release a HALF_OPEN probe reservation without recording an outcome.
+
+        Safety net for attempts that end without a classifiable result — task
+        cancellation (client disconnects cancel handler tasks) or unexpected
+        internal errors. Without this the breaker could stay pinned in
+        HALF_OPEN forever: `_current_state()` only transitions OPEN→HALF_OPEN,
+        so a leaked reservation would block all traffic indefinitely.
+        Idempotent; no-op outside HALF_OPEN reservations.
+        """
+        with self._lock:
+            self._probe_reserved = False
+
 
 async def with_retries[T](
     operation: Callable[[], Awaitable[T]],

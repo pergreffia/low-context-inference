@@ -335,6 +335,80 @@ def json_loads(value):
 
 
 class TestCustomProjectionIntegration:
+    def test_duplicate_tool_call_ids_associate_deterministically(self):
+        """Same message, two calls sharing one tool_call_id: the projection
+        keeps ONE call row (ON CONFLICT DO NOTHING) and the result associates
+        to it deterministically — identical timestamps must not make the
+        outcome replay-dependent (final hardening M2)."""
+        async def scenario():
+            pool = await asyncpg.create_pool(dsn=MIGRATION_DSN, min_size=2, max_size=4)
+            try:
+                store = _store(pool)
+                conv = str(uuid.uuid4())
+                inbound = [
+                    {"role": "assistant", "content": None, "tool_calls": [
+                        {"id": "dup", "type": "function",
+                         "function": {"name": "first_insert", "arguments": "{}"}},
+                        {"id": "dup", "type": "function",
+                         "function": {"name": "second_conflict", "arguments": "{}"}},
+                    ]},
+                    {"role": "tool", "tool_call_id": "dup",
+                     "content": "result-for-dup"},
+                ]
+                await store.reconcile_history(conv, inbound)
+
+                refs = await pool.fetch(
+                    """
+                    SELECT tc.name, tr.content FROM tool_results tr
+                    JOIN tool_calls tc ON tc.id = tr.tool_call_ref
+                    JOIN messages m ON m.id = tc.message_id
+                    WHERE m.conversation_id = $1::uuid
+                    """,
+                    conv,
+                )
+                assert len(refs) == 1                      # exactly one projection
+                first_ref_name = refs[0]["name"]
+                assert json_loads(refs[0]["content"]) == "result-for-dup"
+
+                # full replay must produce the IDENTICAL association
+                await store.reconcile_history(conv, inbound)
+                refs_again = await pool.fetch(
+                    """
+                    SELECT tc.name FROM tool_results tr
+                    JOIN tool_calls tc ON tc.id = tr.tool_call_ref
+                    JOIN messages m ON m.id = tc.message_id
+                    WHERE m.conversation_id = $1::uuid
+                    """,
+                    conv,
+                )
+                assert refs_again[0]["name"] == first_ref_name
+
+                # unique tool_call_id behavior unchanged (control)
+                conv2 = str(uuid.uuid4())
+                normal = [
+                    {"role": "assistant", "content": None, "tool_calls": [
+                        {"id": "u1", "type": "function",
+                         "function": {"name": "solo", "arguments": "{}"}},
+                    ]},
+                    {"role": "tool", "tool_call_id": "u1", "content": "ok"},
+                ]
+                await store.reconcile_history(conv2, normal)
+                control = await pool.fetch(
+                    """
+                    SELECT tc.name FROM tool_results tr
+                    JOIN tool_calls tc ON tc.id = tr.tool_call_ref
+                    WHERE tr.tool_call_id='u1'
+                      AND tc.message_id IN (SELECT id FROM messages
+                                            WHERE conversation_id=$1::uuid)
+                    """,
+                    conv2,
+                )
+                assert len(control) == 1 and control[0]["name"] == "solo"
+            finally:
+                await pool.close()
+
+        asyncio.run(scenario())
+
     def test_function_and_custom_calls_projected_relationally(self):
         async def scenario():
             pool = await asyncpg.create_pool(dsn=MIGRATION_DSN, min_size=2, max_size=4)

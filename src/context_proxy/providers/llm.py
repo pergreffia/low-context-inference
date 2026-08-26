@@ -121,8 +121,10 @@ class OpenAICompatibleLLMProvider:
     ) -> httpx.Response:
         """Send with breaker + bounded transport retries (M5).
 
-        A fresh request is built per attempt: httpx requests are not safely
-        reusable after a send. The breaker fails fast while OPEN.
+        A fresh buffered request is built per attempt (httpx requests are not
+        safely reusable after a send). The streaming path reuses the original
+        request object — safe because `json=` payloads are encoded to immutable
+        bytes at build time; retries there only cover the pre-open phase.
 
         Retry/breaker policy (post-0876b10 review §3): only provably pre-send
         failures (ConnectError/ConnectTimeout) are retried and counted as
@@ -131,10 +133,17 @@ class OpenAICompatibleLLMProvider:
         it is NEVER retried and does NOT trip the breaker; it still surfaces
         to the client as the standard upstream-unavailable contract. An HTTP
         response — even 5xx — is an answer and closes the breaker.
+
+        Probe lifecycle (final hardening pass): a HALF_OPEN probe reservation
+        is ALWAYS released — classified outcomes via record_success/failure,
+        everything else (cancellation on client disconnect, unexpected errors)
+        via the idempotent `release_probe()` safety net in the finally block,
+        so the breaker can never stay pinned in HALF_OPEN.
         """
         import time as _time
 
-        if not self._breaker.allow_attempt():
+        probe_allowed = self._breaker.allow_attempt()
+        if not probe_allowed:
             DEGRADATIONS_TOTAL.labels(component="upstream_breaker_open").inc()
             raise UpstreamUnavailable(
                 f"inference endpoint circuit breaker is {self._breaker.state}"
@@ -186,13 +195,23 @@ class OpenAICompatibleLLMProvider:
                 },
             )
             raise map_upstream_error(exc) from exc
-
-        UPSTREAM_DURATION.labels(route=self._route_label).observe(
-            _time.monotonic() - started
-        )
-        # Any HTTP answer means the endpoint is reachable.
-        self._breaker.record_success()
-        return response
+        except BaseException:
+            # Cancellation (client disconnects cancel handler tasks) or any
+            # unclassified error: re-raise unchanged — the finally below
+            # guarantees the HALF_OPEN probe reservation is released.
+            raise
+        else:
+            UPSTREAM_DURATION.labels(route=self._route_label).observe(
+                _time.monotonic() - started
+            )
+            # Any HTTP answer means the endpoint is reachable.
+            self._breaker.record_success()
+            return response
+        finally:
+            # Idempotent safety net guaranteeing no leaked HALF_OPEN probe on
+            # ANY exit path (classified outcomes already released their own
+            # reservation inside record_success/record_failure).
+            self._breaker.release_probe()
 
     def _prepared(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Resolve the configured inference model without mutating the caller's payload.

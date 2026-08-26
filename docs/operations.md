@@ -72,8 +72,14 @@ method/route-template/status/component/direction/state):
 | `context_proxy_rate_limit_rejects_total` | rejected requests (once each) |
 | `context_proxy_rate_limit_identities_evicted_total` | buckets dropped via TTL/capacity |
 | `context_proxy_assistant_capture_overflow_total` | streamed responses whose capture was disabled (passthrough unaffected) |
-| `context_proxy_http_streams_aborted_total` | streams started then aborted |
-| `context_proxy_client_disconnects_total` | abandoned requests mid-body |
+| `context_proxy_http_streams_aborted_total` | streams started then aborted (exception path) |
+| `context_proxy_client_disconnects_total` | abandoned requests during body upload |
+
+Known observability limitation: a client disconnecting cleanly mid-stream
+(generator closed without an exception, ASGI `http.disconnect` after
+response start) cannot be reliably distinguished from normal completion in
+the current lifecycle, so it increments no dedicated counter. Aborts caused
+by upstream failures ARE counted via `streams_aborted_total`.
 | `context_proxy_circuit_state` | gauge: current breaker state |
 
 Route labels are normalized templates (`/v1/chat/completions`,

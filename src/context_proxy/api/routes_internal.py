@@ -52,11 +52,21 @@ INTERNAL_AUTH_HEADER = "x-internal-auth"
 async def require_internal_auth(request: Request) -> None:
     """Configurable application-level gate for the administrative surface.
 
-    Token unset -> allow (local deployment, network provides the boundary).
-    Token set   -> constant-time comparison against X-Internal-Auth.
+    Fail-closed defense-in-depth (final hardening pass): production mode with
+    an empty token is refused at RUNTIME too (503, server misconfiguration),
+    independently of the configuration validator — which can be bypassed by
+    `model_copy`-style programmatic settings construction.
+
+    Token unset in development -> allow (network provides the boundary).
+    Token set                  -> constant-time comparison against the header.
     """
     expected = request.app.state.settings.security.internal_auth_token
     if not expected:
+        if request.app.state.settings.security.mode == "production":
+            raise HTTPException(
+                status_code=503,
+                detail="internal authentication is misconfigured",
+            )
         return
     presented = request.headers.get(INTERNAL_AUTH_HEADER)
     if presented is None or not hmac.compare_digest(presented, expected):

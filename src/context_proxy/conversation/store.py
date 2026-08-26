@@ -223,15 +223,16 @@ class PostgresConversationStore:
             )
         if message.get("role") == "tool" and message.get("tool_call_id"):
             # Association rule: newest matching call within the SAME
-            # conversation (ORDER BY created_at DESC). Duplicate tool_call_ids
-            # resolve deterministically to the most recent call; results never
-            # cross conversations.
+            # conversation (created_at DESC, then id DESC as a total-order
+            # tie-break — identical timestamps must stay deterministic).
+            # Duplicate call ids resolve deterministically to the most recent
+            # call; results never cross conversations.
             tool_call_ref = await conn.fetchval(
                 """
                 SELECT tc.id FROM tool_calls tc
                 JOIN messages m ON m.id = tc.message_id
                 WHERE m.conversation_id = $1::uuid AND tc.tool_call_id = $2
-                ORDER BY tc.created_at DESC
+                ORDER BY tc.created_at DESC, tc.id DESC
                 LIMIT 1
                 """,
                 conversation_id,
