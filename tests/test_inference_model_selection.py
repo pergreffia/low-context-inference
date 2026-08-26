@@ -85,6 +85,36 @@ async def test_stream_forwards_client_model_without_server_override() -> None:
     assert seen[0]["model"] == "stream-model"
 
 
+@pytest.mark.asyncio
+async def test_list_models_is_a_passthrough_to_configured_inference_endpoint() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(
+            200,
+            headers={"x-provider": "test"},
+            content=b'{"object":"list","data":[{"id":"model-a"}]}',
+        )
+
+    client = httpx.AsyncClient(
+        base_url="http://provider.test/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    provider = OpenAICompatibleLLMProvider(
+        EndpointSettings(base_url="http://provider.test/v1"), client=client
+    )
+    try:
+        status, headers, body = await provider.list_models()
+    finally:
+        await provider.aclose()
+
+    assert status == 200
+    assert seen == ["/v1/models"]
+    assert body == b'{"object":"list","data":[{"id":"model-a"}]}'
+    assert headers["x-provider"] == "test"
+
+
 def test_inference_settings_have_no_model_configuration() -> None:
     settings = Settings()
 
