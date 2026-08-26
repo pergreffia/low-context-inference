@@ -219,7 +219,6 @@ class TestStartupCleanupOwnership:
 
         # explodes AFTER both embed and qdrant clients were app-created
         monkeypatch.setattr(main_module, "QdrantVectorStore", BoomVectors)
-        monkeypatch.setattr(main_module, "PostgresConversationStore", lambda *a, **k: None)
 
         settings = make_settings().model_copy(
             update={"database": DatabaseSettings(url="postgresql://ok/ok")}
