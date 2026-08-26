@@ -52,16 +52,13 @@ def equivalent(a: dict[str, Any], b: dict[str, Any]) -> bool:
 
     # OpenCode may prune a completed tool output while retaining the structured
     # tool result and tool_call_id. The placeholder is a deliberate projection
-    # marker, not new conversation content. Match it only to the same non-empty
-    # tool call; unknown/missing IDs remain conflicts.
+    # marker, not new conversation content. Match it only when it is present in
+    # the incoming projection and identifies the same non-empty tool call.
     if left.get("role") == right.get("role") == "tool":
         tool_call_id = left.get("tool_call_id")
         if not tool_call_id or tool_call_id != right.get("tool_call_id"):
             return False
-        return (
-            left.get("content") == PRUNED_TOOL_RESULT
-            or right.get("content") == PRUNED_TOOL_RESULT
-        )
+        return right.get("content") == PRUNED_TOOL_RESULT
 
     return False
 
