@@ -41,7 +41,6 @@ def test_conversation_roundtrip_with_tool_parts():
     async def _run():
         pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
         try:
-            # FK-safe cleanup so the test is re-runnable on a dirty database.
             await pool.execute(
                 """
                 DELETE FROM tool_results WHERE message_id IN
@@ -120,6 +119,62 @@ def test_append_preserves_order_across_batches():
             await store.append_messages(conv, [{"role": "user", "content": "3"}])
             rebuilt = await store.get_messages(conv)
             assert [m["content"] for m in rebuilt] == ["1", "2", "3"]
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_reconcile_accepts_opencode_projection_without_rewriting_raw_history():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            persisted = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world", "reasoning_content": "A"},
+            ]
+            await store.append_messages(conv, persisted)
+
+            incoming = [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "assistant", "content": "world", "reasoning_content": "B"},
+                {"role": "user", "content": "next"},
+            ]
+            await store.reconcile_history(conv, incoming)
+
+            rebuilt = await store.get_messages(conv)
+            assert rebuilt[:2] == persisted
+            assert rebuilt[2] == incoming[2]
+        finally:
+            await pool.close()
+
+    asyncio.run(_run())
+
+
+def test_reconcile_rejects_real_rewrite():
+    async def _run():
+        pool = await asyncpg.create_pool(dsn=MIGRATION_DSN)
+        try:
+            conv = str(uuid.uuid4())
+            store = _store(pool)
+            persisted = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "original"},
+            ]
+            await store.append_messages(conv, persisted)
+
+            from context_proxy.conversation.store import HistoryDivergenceError
+
+            with pytest.raises(HistoryDivergenceError, match="diverges from persisted history"):
+                await store.reconcile_history(
+                    conv,
+                    [
+                        persisted[0],
+                        {"role": "assistant", "content": "rewritten"},
+                    ],
+                )
         finally:
             await pool.close()
 
