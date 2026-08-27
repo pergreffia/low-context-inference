@@ -109,12 +109,16 @@ async def chat_completions(request: Request):
             logger.warning(
                 "history_reconciliation_conflict "
                 "conversation_id=%s index=%s persisted_sha256=%s "
-                "incoming_sha256=%s different_fields=%s",
+                "incoming_sha256=%s different_fields=%s "
+                "persisted_len=%s incoming_len=%s prefix_len=%s",
                 exc.conversation_id,
                 exc.index,
                 exc.persisted_hash,
                 exc.incoming_hash,
                 exc.different_fields,
+                exc.persisted_len,
+                exc.incoming_len,
+                exc.prefix_len,
             )
             return openai_error(
                 str(exc),
@@ -188,12 +192,16 @@ async def chat_completions(request: Request):
             logger.warning(
                 "assistant_persistence_conflict "
                 "conversation_id=%s index=%s persisted_sha256=%s "
-                "incoming_sha256=%s different_fields=%s",
+                "incoming_sha256=%s different_fields=%s "
+                "persisted_len=%s incoming_len=%s prefix_len=%s",
                 exc.conversation_id,
                 exc.index,
                 exc.persisted_hash,
                 exc.incoming_hash,
                 exc.different_fields,
+                exc.persisted_len,
+                exc.incoming_len,
+                exc.prefix_len,
             )
             return
         except _PERSISTENCE_INFRA_ERRORS as exc:
