@@ -31,6 +31,31 @@ def _text_content(value: Any) -> str | None:
     return "".join(parts)
 
 
+def _canonical_tool_calls(value: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+    result: list[Any] = []
+    for item in value:
+        if not isinstance(item, dict):
+            result.append(item)
+            continue
+        tool = dict(item)
+        function = tool.get("function")
+        if isinstance(function, dict):
+            function = dict(function)
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    parsed = json.loads(arguments)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    function["arguments"] = parsed
+            tool["function"] = function
+        result.append(tool)
+    return result
+
+
 def canonical_message(message: dict[str, Any]) -> dict[str, Any]:
     """Canonicalize only known representation-level differences."""
     result = dict(message)
@@ -41,6 +66,8 @@ def canonical_message(message: dict[str, Any]) -> dict[str, Any]:
         result["content"] = text
     if result.get("role") == "assistant" and result.get("tool_calls") and result.get("content") is None:
         result["content"] = ""
+    if "tool_calls" in result:
+        result["tool_calls"] = _canonical_tool_calls(result["tool_calls"])
     return result
 
 
