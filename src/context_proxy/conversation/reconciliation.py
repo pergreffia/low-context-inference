@@ -134,10 +134,28 @@ def _tool_argument_details(value: Any) -> tuple[dict[str, Any], ...]:
         function = item.get("function")
         arguments = function.get("arguments") if isinstance(function, dict) else None
         shape = _argument_shape(arguments)
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except (TypeError, ValueError):
+                parsed = None
+        else:
+            parsed = arguments
+        field_details: list[dict[str, Any]] = []
+        if isinstance(parsed, dict):
+            for key in sorted(parsed):
+                field_value = parsed[key]
+                if isinstance(field_value, str):
+                    raw_value = field_value.encode("utf-8")
+                    field_details.append({"key": key, "type": "str", "len": len(field_value), "sha256": hashlib.sha256(raw_value).hexdigest()[:16]})
+                else:
+                    raw_value = json.dumps(field_value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    field_details.append({"key": key, "type": type(field_value).__name__, "len": len(raw_value), "sha256": hashlib.sha256(raw_value).hexdigest()[:16]})
         details.append({
             "id": item.get("id"),
             "name": function.get("name") if isinstance(function, dict) else None,
             "argument_shape": shape,
+            "argument_fields": tuple(field_details),
         })
     return tuple(details)
 
