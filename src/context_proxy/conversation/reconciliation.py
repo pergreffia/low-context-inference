@@ -105,6 +105,43 @@ def _tool_details(value: Any) -> tuple[dict[str, Any], ...]:
     return tuple(details)
 
 
+def _argument_shape(value: Any) -> tuple[str, int, str | None, tuple[str, ...], tuple[str, ...]]:
+    if isinstance(value, str):
+        raw = value
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return "str", len(raw), hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16], (), ()
+        if isinstance(parsed, dict):
+            return "str-json-object", len(raw), hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16], tuple(sorted(parsed)), tuple(
+                key for key, item in parsed.items() if isinstance(item, (str, int, float, bool)) or item is None
+            )
+        return f"str-json-{type(parsed).__name__}", len(raw), hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16], (), ()
+    if isinstance(value, dict):
+        return "dict", len(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))), None, tuple(sorted(value)), tuple(
+            key for key, item in value.items() if isinstance(item, (str, int, float, bool)) or item is None
+        )
+    return type(value).__name__, 0, None, (), ()
+
+
+def _tool_argument_details(value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        return ()
+    details: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        arguments = function.get("arguments") if isinstance(function, dict) else None
+        shape = _argument_shape(arguments)
+        details.append({
+            "id": item.get("id"),
+            "name": function.get("name") if isinstance(function, dict) else None,
+            "argument_shape": shape,
+        })
+    return tuple(details)
+
+
 def _diagnose_difference(index: int, persisted: dict[str, Any], incoming: dict[str, Any]) -> None:
     left = canonical_message(persisted)
     right = canonical_message(incoming)
@@ -116,7 +153,8 @@ def _diagnose_difference(index: int, persisted: dict[str, Any], incoming: dict[s
         "history_reconciliation_message_difference index=%s persisted_role=%s incoming_role=%s "
         "persisted_keys=%s incoming_keys=%s canonical_persisted_sha256=%s canonical_incoming_sha256=%s "
         "canonical_different_fields=%s persisted_content_shape=%s incoming_content_shape=%s "
-        "persisted_tool_shape=%s incoming_tool_shape=%s persisted_tool_details=%s incoming_tool_details=%s",
+        "persisted_tool_shape=%s incoming_tool_shape=%s persisted_tool_details=%s incoming_tool_details=%s "
+        "persisted_tool_argument_details=%s incoming_tool_argument_details=%s",
         index,
         persisted.get("role"),
         incoming.get("role"),
@@ -131,6 +169,8 @@ def _diagnose_difference(index: int, persisted: dict[str, Any], incoming: dict[s
         incoming_tools,
         _tool_details(left.get("tool_calls")),
         _tool_details(right.get("tool_calls")),
+        _tool_argument_details(left.get("tool_calls")),
+        _tool_argument_details(right.get("tool_calls")),
     )
 
 
