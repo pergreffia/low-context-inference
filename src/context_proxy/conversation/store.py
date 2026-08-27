@@ -66,9 +66,8 @@ class HistoryDivergenceError(Exception):
             self.different_fields = _differing_fields(persisted, incoming)
             suffix = (
                 f" [persisted_sha256={self.persisted_hash} incoming_sha256={self.incoming_hash}"
-                f" different_fields={self.different_fields}"
-                f" persisted_len={self.persisted_len} incoming_len={self.incoming_len}"
-                f" prefix_len={self.prefix_len}]"
+                f" different_fields={self.different_fields} persisted_len={self.persisted_len}"
+                f" incoming_len={self.incoming_len} prefix_len={self.prefix_len}]"
             )
         super().__init__(f"conversation {conversation_id}: incoming message {index} diverges from persisted history{suffix}")
 
@@ -108,6 +107,14 @@ class PostgresConversationStore:
                 await self._lock_conversation(conn, conversation_id)
                 persisted = await self._fetch_messages(conn, conversation_id)
                 result = reconcile_projection(persisted, messages)
+                logger.warning(
+                    "history_reconciliation_result conversation_id=%s mode=%s append_from=%s persisted_len=%s incoming_len=%s",
+                    conversation_id,
+                    result.mode,
+                    result.append_from,
+                    len(persisted),
+                    len(messages),
+                )
                 if result.mode == "conflict":
                     prefix_len = min(len(persisted), len(messages))
                     index = prefix_len
