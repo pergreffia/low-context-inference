@@ -82,6 +82,29 @@ def _tool_shape(value: Any) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
     return len(value), tuple(ids), tuple(names)
 
 
+def _tool_details(value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        return ()
+    details: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        arguments = function.get("arguments") if isinstance(function, dict) else None
+        argument_payload = json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if not isinstance(arguments, str) else arguments
+        argument_bytes = argument_payload.encode("utf-8")
+        item_payload = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        details.append({
+            "keys": tuple(sorted(item.keys())),
+            "function_keys": tuple(sorted(function.keys())) if isinstance(function, dict) else (),
+            "arguments_type": type(arguments).__name__ if arguments is not None else "null",
+            "arguments_len": len(argument_payload) if arguments is not None else 0,
+            "arguments_sha256": hashlib.sha256(argument_bytes).hexdigest()[:16] if arguments is not None else None,
+            "tool_sha256": hashlib.sha256(item_payload.encode("utf-8")).hexdigest()[:16],
+        })
+    return tuple(details)
+
+
 def _diagnose_difference(index: int, persisted: dict[str, Any], incoming: dict[str, Any]) -> None:
     left = canonical_message(persisted)
     right = canonical_message(incoming)
@@ -93,7 +116,7 @@ def _diagnose_difference(index: int, persisted: dict[str, Any], incoming: dict[s
         "history_reconciliation_message_difference index=%s persisted_role=%s incoming_role=%s "
         "persisted_keys=%s incoming_keys=%s canonical_persisted_sha256=%s canonical_incoming_sha256=%s "
         "canonical_different_fields=%s persisted_content_shape=%s incoming_content_shape=%s "
-        "persisted_tool_shape=%s incoming_tool_shape=%s",
+        "persisted_tool_shape=%s incoming_tool_shape=%s persisted_tool_details=%s incoming_tool_details=%s",
         index,
         persisted.get("role"),
         incoming.get("role"),
@@ -106,6 +129,8 @@ def _diagnose_difference(index: int, persisted: dict[str, Any], incoming: dict[s
         incoming_content,
         persisted_tools,
         incoming_tools,
+        _tool_details(left.get("tool_calls")),
+        _tool_details(right.get("tool_calls")),
     )
 
 
