@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from context_proxy.conversation.reconciliation import reconcile_projection
@@ -9,6 +10,8 @@ from context_proxy.conversation.store import (
     HistoryDivergenceError,
     PostgresConversationStore,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectionAwareConversationStore(PostgresConversationStore):
@@ -26,9 +29,22 @@ class ProjectionAwareConversationStore(PostgresConversationStore):
                 await self._lock_conversation(conn, conversation_id)
                 persisted = await self._fetch_messages(conn, conversation_id)
                 result = reconcile_projection(persisted, messages)
+                logger.warning(
+                    "history_reconciliation_result conversation_id=%s mode=%s append_from=%s persisted_len=%s incoming_len=%s",
+                    conversation_id,
+                    result.mode,
+                    result.append_from,
+                    len(persisted),
+                    len(messages),
+                )
 
                 if result.mode == "conflict":
-                    index = min(len(persisted), len(messages))
+                    prefix_len = min(len(persisted), len(messages))
+                    index = prefix_len
+                    for candidate in range(prefix_len):
+                        if persisted[candidate] != messages[candidate]:
+                            index = candidate
+                            break
                     persisted_message = (
                         persisted[index] if index < len(persisted) else None
                     )
@@ -40,6 +56,9 @@ class ProjectionAwareConversationStore(PostgresConversationStore):
                         index,
                         persisted=persisted_message,
                         incoming=incoming_message,
+                        persisted_len=len(persisted),
+                        incoming_len=len(messages),
+                        prefix_len=index,
                     )
 
                 if result.append_from is None or result.append_from >= len(messages):
