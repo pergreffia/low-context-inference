@@ -156,7 +156,7 @@ async def chat_completions(request: Request):
 
     async def persist_assistant(message: dict | None, metadata: dict | None = None) -> None:
         record_tokens(metadata.get("usage") if metadata else None)
-        logger.debug("assistant_message_received", extra={"conversation_id": conversation_id, "message": message, "metadata": metadata})
+        logger.debug("assistant_message_received", extra={"conversation_id": conversation_id, "assistant_message": message, "metadata": metadata})
         if store is None or message is None or auxiliary_projection:
             return
         try:
