@@ -102,14 +102,14 @@ async def chat_completions(request: Request):
             record_stage(request, "inbound_persistence", stage_start)
         except HistoryDivergenceError as exc:
             logger.warning(
-                "history_reconciliation_conflict",
-                extra={
-                    "conversation_id": exc.conversation_id,
-                    "message_index": exc.index,
-                    "persisted_sha256": exc.persisted_hash,
-                    "incoming_sha256": exc.incoming_hash,
-                    "different_fields": exc.different_fields,
-                },
+                "history_reconciliation_conflict "
+                "conversation_id=%s index=%s persisted_sha256=%s "
+                "incoming_sha256=%s different_fields=%s",
+                exc.conversation_id,
+                exc.index,
+                exc.persisted_hash,
+                exc.incoming_hash,
+                exc.different_fields,
             )
             return openai_error(
                 str(exc),
@@ -181,14 +181,14 @@ async def chat_completions(request: Request):
             )
         except HistoryDivergenceError as exc:
             logger.warning(
-                "assistant_persistence_conflict",
-                extra={
-                    "conversation_id": conversation_id,
-                    "index": exc.index,
-                    "persisted_sha256": exc.persisted_hash,
-                    "incoming_sha256": exc.incoming_hash,
-                    "different_fields": exc.different_fields,
-                },
+                "assistant_persistence_conflict "
+                "conversation_id=%s index=%s persisted_sha256=%s "
+                "incoming_sha256=%s different_fields=%s",
+                exc.conversation_id,
+                exc.index,
+                exc.persisted_hash,
+                exc.incoming_hash,
+                exc.different_fields,
             )
             return
         except _PERSISTENCE_INFRA_ERRORS as exc:
