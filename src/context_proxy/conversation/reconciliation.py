@@ -39,6 +39,8 @@ def canonical_message(message: dict[str, Any]) -> dict[str, Any]:
     text = _text_content(result.get("content"))
     if text is not None:
         result["content"] = text
+    if result.get("role") == "assistant" and result.get("tool_calls") and result.get("content") is None:
+        result["content"] = ""
     return result
 
 
