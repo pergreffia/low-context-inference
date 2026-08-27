@@ -72,12 +72,18 @@ class HistoryDivergenceError(Exception):
         *,
         persisted: dict[str, Any] | None = None,
         incoming: dict[str, Any] | None = None,
+        persisted_len: int | None = None,
+        incoming_len: int | None = None,
+        prefix_len: int | None = None,
     ):
         self.conversation_id = conversation_id
         self.index = index
         self.persisted_hash: str | None = None
         self.incoming_hash: str | None = None
         self.different_fields: list[str] = []
+        self.persisted_len = persisted_len
+        self.incoming_len = incoming_len
+        self.prefix_len = prefix_len
         suffix = ""
         if persisted is not None and incoming is not None:
             self.persisted_hash = _message_fingerprint(persisted)
@@ -170,8 +176,9 @@ class PostgresConversationStore:
                 persisted = await self._fetch_messages(conn, conversation_id)
                 result = reconcile_projection(persisted, messages)
                 if result.mode == "conflict":
-                    index = min(len(persisted), len(messages))
-                    for candidate in range(index):
+                    prefix_len = min(len(persisted), len(messages))
+                    index = prefix_len
+                    for candidate in range(prefix_len):
                         if not equivalent(persisted[candidate], messages[candidate]):
                             index = candidate
                             break
@@ -180,6 +187,9 @@ class PostgresConversationStore:
                         index,
                         persisted=persisted[index] if index < len(persisted) else None,
                         incoming=messages[index] if index < len(messages) else None,
+                        persisted_len=len(persisted),
+                        incoming_len=len(messages),
+                        prefix_len=index,
                     )
                 if result.append_from is None or result.append_from >= len(messages):
                     return []
