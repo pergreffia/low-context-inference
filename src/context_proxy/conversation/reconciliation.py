@@ -52,13 +52,46 @@ def _canonical_differing_fields(left: dict[str, Any], right: dict[str, Any]) -> 
     return sorted(key for key in keys if left.get(key) != right.get(key))
 
 
+def _content_shape(value: Any) -> tuple[str, int, bool, bool, str | None]:
+    if value is None:
+        return "null", 0, True, False, None
+    if isinstance(value, str):
+        return "string", len(value), len(value) == 0, False, None
+    if isinstance(value, list):
+        return "list", len(value), len(value) == 0, False, ",".join(
+            str(item.get("type", "?")) if isinstance(item, dict) else type(item).__name__ for item in value
+        )
+    return type(value).__name__, 0, False, False, None
+
+
+def _tool_shape(value: Any) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
+    if not isinstance(value, list):
+        return 0, (), ()
+    ids: list[str] = []
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("id"), str):
+            ids.append(item["id"])
+        function = item.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            names.append(function["name"])
+    return len(value), tuple(ids), tuple(names)
+
+
 def _diagnose_difference(index: int, persisted: dict[str, Any], incoming: dict[str, Any]) -> None:
     left = canonical_message(persisted)
     right = canonical_message(incoming)
+    persisted_content = _content_shape(left.get("content"))
+    incoming_content = _content_shape(right.get("content"))
+    persisted_tools = _tool_shape(left.get("tool_calls"))
+    incoming_tools = _tool_shape(right.get("tool_calls"))
     logger.warning(
         "history_reconciliation_message_difference index=%s persisted_role=%s incoming_role=%s "
         "persisted_keys=%s incoming_keys=%s canonical_persisted_sha256=%s canonical_incoming_sha256=%s "
-        "canonical_different_fields=%s",
+        "canonical_different_fields=%s persisted_content_shape=%s incoming_content_shape=%s "
+        "persisted_tool_shape=%s incoming_tool_shape=%s",
         index,
         persisted.get("role"),
         incoming.get("role"),
@@ -67,6 +100,10 @@ def _diagnose_difference(index: int, persisted: dict[str, Any], incoming: dict[s
         _canonical_fingerprint(persisted),
         _canonical_fingerprint(incoming),
         _canonical_differing_fields(left, right),
+        persisted_content,
+        incoming_content,
+        persisted_tools,
+        incoming_tools,
     )
 
 
