@@ -27,6 +27,7 @@ from context_proxy.conversation.identity import (
     InvalidConversationId,
     resolve_conversation_id,
 )
+from context_proxy.conversation.projection import is_auxiliary_projection
 from context_proxy.conversation.store import HistoryDivergenceError
 from context_proxy.memory.errors import (
     PersistenceInfrastructureError,
@@ -98,12 +99,20 @@ async def chat_completions(request: Request):
             status_code=400,
         )
     extra_headers = _conversation_headers(conversation_id)
+    messages = payload.get("messages") or []
+    auxiliary_projection = is_auxiliary_projection(messages)
 
-    if store is not None:
+    if auxiliary_projection:
+        logger.info(
+            "history_projection_skipped",
+            extra={"conversation_id": conversation_id},
+        )
+
+    if store is not None and not auxiliary_projection:
         stage_start = _now()
         try:
             await store.ensure_conversation(conversation_id)
-            await store.reconcile_history(conversation_id, payload.get("messages") or [])
+            await store.reconcile_history(conversation_id, messages)
             record_stage(request, "inbound_persistence", stage_start)
         except HistoryDivergenceError as exc:
             logger.warning(
@@ -131,7 +140,6 @@ async def chat_completions(request: Request):
             logger.warning("inbound_persistence_failed", extra={"error": str(exc)})
             store = None
 
-    messages = payload.get("messages") or []
     tools = payload.get("tools")
     engine = getattr(app_state, "context_engine", None)
     stage_start = _now()
@@ -180,7 +188,7 @@ async def chat_completions(request: Request):
 
     async def persist_assistant(message: dict | None, metadata: dict | None = None) -> None:
         record_tokens(metadata.get("usage") if metadata else None)
-        if store is None or message is None:
+        if store is None or message is None or auxiliary_projection:
             return
         try:
             await store.reconcile_history(
