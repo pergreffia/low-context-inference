@@ -25,6 +25,10 @@ class TokenCounter:
     Deliberately model-agnostic (works for any tokenizer family) and
     deterministic. Exact counts are not required for safety because the
     configured safety_margin_tokens absorbs estimation error.
+
+    The estimator is deliberately defensive: unknown provider-specific
+    structures are charged conservatively instead of being validated,
+    normalized, or allowed to break the passthrough request.
     """
 
     def text(self, value: str | None) -> int:
@@ -69,12 +73,28 @@ class TokenCounter:
 
     def message(self, message: dict[str, Any]) -> int:
         tokens = MESSAGE_OVERHEAD_TOKENS
+        if not isinstance(message, dict):
+            return tokens + UNKNOWN_PART_TOKENS
+
         tokens += self._serialized(message.get("content"))
-        for tool_call in message.get("tool_calls") or []:
-            tokens += TOOL_CALL_OVERHEAD_TOKENS
-            function = tool_call.get("function") or {}
-            tokens += self.text(function.get("name"))
-            tokens += self._serialized(function.get("arguments"))
+        tool_calls = message.get("tool_calls") or []
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                tokens += TOOL_CALL_OVERHEAD_TOKENS
+                if not isinstance(tool_call, dict):
+                    tokens += UNKNOWN_PART_TOKENS
+                    continue
+                function = tool_call.get("function")
+                if isinstance(function, dict):
+                    tokens += self.text(function.get("name"))
+                    tokens += self._serialized(function.get("arguments"))
+                else:
+                    # Unknown tool-call containers are opaque. Estimate their
+                    # serialized representation without inspecting semantics.
+                    tokens += self._serialized(function)
+        else:
+            tokens += UNKNOWN_PART_TOKENS
+
         if message.get("tool_call_id"):
             tokens += self.text(message["tool_call_id"])
         if message.get("name"):
