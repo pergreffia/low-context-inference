@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -70,26 +68,14 @@ async def error_body_response(exc: Exception) -> Response:
     from context_proxy.providers.errors import UpstreamHTTPError, UpstreamUnavailable
 
     if isinstance(exc, UpstreamHTTPError):
-        headers = dict(exc.headers)
-        if exc.content_type.startswith("application/json"):
-            try:
-                json.loads(exc.body)
-                return Response(
-                    content=exc.body,
-                    status_code=exc.status_code,
-                    headers=ensure_content_type(headers, default=exc.content_type),
-                )
-            except (ValueError, UnicodeDecodeError):
-                pass
-        # Normalized fallback body is JSON: the upstream Content-Type (e.g.
-        # text/plain) must not leak onto the rewritten body, but safe metadata
-        # headers (Retry-After, X-RateLimit-*, X-Request-ID) survive.
-        safe_headers = {n: v for n, v in headers.items() if n.lower() != "content-type"}
-        return openai_error(
-            "upstream inference endpoint returned an error",
-            err_type="upstream_error",
+        # Upstream HTTP errors are part of the provider contract. Preserve the
+        # status, body and safe response headers instead of normalizing the
+        # provider's error into a proxy-generated OpenAI error. This keeps the
+        # inference data plane transparent for JSON and non-JSON providers.
+        return Response(
+            content=exc.body,
             status_code=exc.status_code,
-            headers=safe_headers,
+            headers=ensure_content_type(dict(exc.headers), default=exc.content_type),
         )
     if isinstance(exc, UpstreamUnavailable):
         return openai_error(
@@ -107,4 +93,3 @@ async def error_body_response(exc: Exception) -> Response:
         code="internal_error",
         status_code=500,
     )
-
