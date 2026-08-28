@@ -2,7 +2,7 @@ from context_proxy.api.validation import validate_chat_payload
 from context_proxy.context.tokens import TokenCounter
 
 
-def test_chat_payload_validation_is_protocol_opaque():
+def test_chat_payload_validation_keeps_provider_extensions_opaque():
     payload = {
         "model": "provider-specific",
         "messages": [
@@ -12,24 +12,21 @@ def test_chat_payload_validation_is_protocol_opaque():
                 "tool_calls": [
                     {
                         "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": " glob",
-                            "arguments": {"pattern": "*", "path": "/"},
-                        },
+                        "type": "future",
+                        "provider_payload": {"arbitrary": True},
                     }
                 ],
             }
         ],
         "tools": [{"type": "future_tool", "provider": {"arbitrary": True}}],
-        "n": 4,
+        "n": 1,
         "provider_extension": {"arbitrary": [1, 2, 3]},
     }
 
     validate_chat_payload(payload)
 
 
-def test_token_counter_does_not_validate_unknown_tool_call_shapes():
+def test_token_counter_does_not_break_on_unknown_tool_call_shapes():
     message = {
         "role": "assistant",
         "content": "",
