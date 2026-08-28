@@ -35,8 +35,6 @@ def validate_chat_payload(payload: dict[str, Any]) -> None:
     if not isinstance(messages, list) or isinstance(messages, bool):
         raise _reject("'messages' must be an array of message objects")
     if not messages:
-        # OpenAI-compatible contract requires at least one message; an
-        # empty array would only produce provider-specific errors.
         raise _reject("'messages' must not be empty")
     for index, message in enumerate(messages):
         _validate_message(message, index)
@@ -57,25 +55,23 @@ def validate_chat_payload(payload: dict[str, Any]) -> None:
         if isinstance(n, bool) or not isinstance(n, int):
             raise _reject("'n' must be an integer when present")
         if n > 1:
-            # Streaming capture persists only the first choice (documented
-            # M6-final contract): multi-choice is rejected up-front instead of
-            # being silently under-persisted.
             raise _reject("only n=1 is supported by this proxy")
 
 
 def _validate_tool(tool: Any, where: str) -> None:
-    """Shape-only checks for tool definitions the proxy relies on."""
     if not isinstance(tool, dict):
         raise _reject(f"{where} must be an object")
     tool_type = tool.get("type")
     if not isinstance(tool_type, str) or not tool_type:
         raise _reject(f"{where}.type must be a non-empty string")
     if tool_type != "function" and tool_type != "custom":
-        return  # unknown future tool types stay structurally opaque
+        return
     container_key = "function" if tool_type == "function" else "custom"
     container = tool.get(container_key)
     if not isinstance(container, dict):
-        raise _reject(f"{where}.{container_key} must be an object for {tool_type} tools")
+        raise _reject(
+            f"{where}.{container_key} must be an object for {tool_type} tools"
+        )
     name = container.get("name")
     if not isinstance(name, str) or not name:
         raise _reject(f"{where}.{container_key}.name must be a non-empty string")
@@ -85,7 +81,6 @@ def _validate_tool(tool: Any, where: str) -> None:
             f"{where}.{container_key}.description must be a string when present"
         )
     parameters = function_parameters_or_none(tool_type, container)
-    # JSON Schema contents are NOT validated — only the container shape.
     if parameters is not None and not isinstance(parameters, dict):
         raise _reject(
             f"{where}.{container_key}.parameters must be an object when present"
@@ -97,13 +92,6 @@ def function_parameters_or_none(tool_type: str, container: dict) -> Any:
 
 
 def _validate_tool_calls(tool_calls: Any, where: str) -> None:
-    """Type-aware shape checks for assistant tool_calls (final review §2).
-
-    type == function -> function object with non-empty string name;
-    type == custom   -> custom object with non-empty string name;
-    unknown/absent   -> validate whichever known container is present; a call
-                        carrying neither is rejected (transport noise).
-    """
     for index, call in enumerate(tool_calls):
         call_where = f"{where}[{index}]"
         if not isinstance(call, dict):
@@ -112,11 +100,8 @@ def _validate_tool_calls(tool_calls: Any, where: str) -> None:
         if call_id is not None and not isinstance(call_id, str):
             raise _reject(f"{call_where}.id must be a string when present")
         call_type = call.get("type")
-
         if isinstance(call_type, str) and call_type not in ("function", "custom"):
-            # Unknown future tool-call types stay structurally opaque.
             continue
-
         if call_type == "custom":
             container, key = call.get("custom"), "custom"
         elif call_type == "function":
@@ -126,22 +111,21 @@ def _validate_tool_calls(tool_calls: Any, where: str) -> None:
         elif "custom" in call:
             container, key = call["custom"], "custom"
         else:
-            raise _reject(
-                f"{call_where} must carry a 'function' or 'custom' payload"
-            )
-
+            raise _reject(f"{call_where} must carry a 'function' or 'custom' payload")
         if not isinstance(container, dict):
             raise _reject(f"{call_where}.{key} must be an object")
         name = container.get("name")
         if not isinstance(name, str) or not name:
             raise _reject(f"{call_where}.{key}.name must be a non-empty string")
         arguments_or_input = (
-            container.get("arguments") if key == "function" else container.get("input")
+            container.get("arguments")
+            if key == "function"
+            else container.get("input")
         )
         if arguments_or_input is not None and not isinstance(arguments_or_input, str):
+            argument_key = "arguments" if key == "function" else "input"
             raise _reject(
-                f"{call_where}.{key}.{('arguments' if key == 'function' else 'input')}"
-                " must be a string when present"
+                f"{call_where}.{key}.{argument_key} must be a string when present"
             )
 
 
@@ -152,22 +136,14 @@ def _validate_message(message: Any, index: int) -> None:
     role = message.get("role")
     if not isinstance(role, str) or not role:
         raise _reject(f"{where}.role must be a non-empty string")
-
     if "content" in message:
         content = message["content"]
         if content is not None and not isinstance(content, str | list):
             raise _reject(f"{where}.content must be a string, array, or null")
         if isinstance(content, list):
             for part_index, part in enumerate(content):
-                # Array parts MUST be objects (M6 final review P2): string or
-                # scalar elements would silently vanish from multimodal
-                # canonicalization. Object parts stay opaque (unknown types
-                # and fields pass through untouched).
                 if not isinstance(part, dict):
-                    raise _reject(
-                        f"{where}.content[{part_index}] must be an object"
-                    )
-
+                    raise _reject(f"{where}.content[{part_index}] must be an object")
     tool_calls = message.get("tool_calls")
     if tool_calls is not None:
         if not isinstance(tool_calls, list):
