@@ -47,7 +47,11 @@ class TokenCounter:
             kind = self._part_type(part)
             if kind == "text":
                 text_value = part.get("text")
-                total += self.text(text_value) if isinstance(text_value, str) else UNKNOWN_PART_TOKENS
+                total += (
+                    self.text(text_value)
+                    if isinstance(text_value, str)
+                    else UNKNOWN_PART_TOKENS
+                )
             elif kind == "image_url":
                 total += IMAGE_PART_TOKENS
             else:
