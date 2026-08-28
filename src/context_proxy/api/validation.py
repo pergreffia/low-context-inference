@@ -69,16 +69,22 @@ def _validate_tool(tool: Any, where: str) -> None:
     container_key = "function" if tool_type == "function" else "custom"
     container = tool.get(container_key)
     if not isinstance(container, dict):
-        raise _reject(f"{where}.{container_key} must be an object for {tool_type} tools")
+        raise _reject(
+            f"{where}.{container_key} must be an object for {tool_type} tools"
+        )
     name = container.get("name")
     if not isinstance(name, str) or not name:
         raise _reject(f"{where}.{container_key}.name must be a non-empty string")
     description = container.get("description")
     if description is not None and not isinstance(description, str):
-        raise _reject(f"{where}.{container_key}.description must be a string when present")
+        raise _reject(
+            f"{where}.{container_key}.description must be a string when present"
+        )
     parameters = function_parameters_or_none(tool_type, container)
     if parameters is not None and not isinstance(parameters, dict):
-        raise _reject(f"{where}.{container_key}.parameters must be an object when present")
+        raise _reject(
+            f"{where}.{container_key}.parameters must be an object when present"
+        )
 
 
 def function_parameters_or_none(tool_type: str, container: dict) -> Any:
@@ -111,9 +117,16 @@ def _validate_tool_calls(tool_calls: Any, where: str) -> None:
         name = container.get("name")
         if not isinstance(name, str) or not name:
             raise _reject(f"{call_where}.{key}.name must be a non-empty string")
-        arguments_or_input = container.get("arguments") if key == "function" else container.get("input")
+        arguments_or_input = (
+            container.get("arguments")
+            if key == "function"
+            else container.get("input")
+        )
         if arguments_or_input is not None and not isinstance(arguments_or_input, str):
-            raise _reject(f"{call_where}.{key}.{'arguments' if key == 'function' else 'input'} must be a string when present")
+            argument_key = "arguments" if key == "function" else "input"
+            raise _reject(
+                f"{call_where}.{key}.{argument_key} must be a string when present"
+            )
 
 
 def _validate_message(message: Any, index: int) -> None:
