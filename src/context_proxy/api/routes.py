@@ -114,12 +114,13 @@ async def chat_completions(request: Request):
             record_stage(request, "inbound_persistence", stage_start)
         except HistoryDivergenceError as exc:
             logger.warning(
-                "history_reconciliation_conflict conversation_id=%s index=%s persisted_sha256=%s incoming_sha256=%s different_fields=%s persisted_len=%s incoming_len=%s prefix_len=%s",
+                "history_reconciliation_conflict conversation_id=%s index=%s persisted_sha256=%s incoming_sha256=%s different_fields=%s persisted_len=%s incoming_len=%s prefix_len=%s; continuing with client projection",
                 exc.conversation_id, exc.index, exc.persisted_hash, exc.incoming_hash, exc.different_fields,
                 exc.persisted_len, exc.incoming_len, exc.prefix_len,
             )
             logger.debug("history_reconciliation_exception", extra={"conversation_id": conversation_id, "error": str(exc)})
-            return openai_error(str(exc), err_type="invalid_request_error", code="history_conflict", status_code=409, headers=extra_headers)
+            # Conversation persistence is observational. A history projection
+            # conflict must never reject an otherwise valid inference request.
         except _PERSISTENCE_INFRA_ERRORS as exc:
             logger.warning("inbound_persistence_failed", extra={"error": str(exc)})
             store = None
@@ -164,7 +165,7 @@ async def chat_completions(request: Request):
             await store.reconcile_history(conversation_id, [*messages, message], metadata=metadata)
         except HistoryDivergenceError as exc:
             logger.warning(
-                "assistant_persistence_conflict conversation_id=%s index=%s persisted_sha256=%s incoming_sha256=%s different_fields=%s persisted_len=%s incoming_len=%s prefix_len=%s",
+                "assistant_persistence_conflict conversation_id=%s index=%s persisted_sha256=%s incoming_sha256=%s different_fields=%s persisted_len=%s incoming_len=%s prefix_len=%s; continuing without persistence",
                 exc.conversation_id, exc.index, exc.persisted_hash, exc.incoming_hash, exc.different_fields,
                 exc.persisted_len, exc.incoming_len, exc.prefix_len,
             )
